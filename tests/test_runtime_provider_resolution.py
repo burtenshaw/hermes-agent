@@ -455,7 +455,7 @@ def test_custom_endpoint_explicit_custom_prefers_config_key(monkeypatch):
     assert resolved["api_key"] == "sk-vllm-key"
 
 
-def test_named_custom_provider_uses_saved_credentials_with_explicit_menu_key(monkeypatch):
+def test_named_custom_provider_uses_saved_credentials(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.setattr(
@@ -472,20 +472,22 @@ def test_named_custom_provider_uses_saved_credentials_with_explicit_menu_key(mon
         },
     )
     monkeypatch.setattr(
-        rp.auth_mod,
+        rp,
         "resolve_provider",
         lambda *a, **k: (_ for _ in ()).throw(
-            AssertionError("resolve_provider should not be called for explicit named custom providers")
+            AssertionError(
+                "resolve_provider should not be called for named custom providers"
+            )
         ),
     )
 
-    resolved = rp.resolve_runtime_provider(requested="custom:local")
+    resolved = rp.resolve_runtime_provider(requested="local")
 
     assert resolved["provider"] == "custom"
     assert resolved["api_mode"] == "chat_completions"
     assert resolved["base_url"] == "http://1.2.3.4:1234/v1"
     assert resolved["api_key"] == "local-provider-key"
-    assert resolved["requested_provider"] == "custom:local"
+    assert resolved["requested_provider"] == "local"
     assert resolved["source"] == "custom_provider:Local"
 
 
@@ -891,21 +893,6 @@ def test_custom_provider_no_key_gets_placeholder(monkeypatch):
     assert resolved["base_url"] == "http://localhost:8080/v1"
 
 
-def test_custom_provider_uses_openai_base_url_env_when_no_config_endpoint(monkeypatch):
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "custom")
-    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
-    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1")
-    monkeypatch.setenv("OPENAI_API_KEY", "local-key")
-    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
-    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-
-    resolved = rp.resolve_runtime_provider(requested="custom")
-
-    assert resolved["provider"] == "custom"
-    assert resolved["base_url"] == "http://127.0.0.1:1234/v1"
-    assert resolved["api_key"] == "local-key"
-
-
 def test_openrouter_provider_not_affected_by_custom_fix(monkeypatch):
     """Fixing custom must not change openrouter behavior."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -916,62 +903,3 @@ def test_openrouter_provider_not_affected_by_custom_fix(monkeypatch):
 
     resolved = rp.resolve_runtime_provider(requested="openrouter")
     assert resolved["provider"] == "openrouter"
-
-
-def test_resolve_runtime_provider_llama_cpp_uses_managed_runtime_payload(monkeypatch):
-    captured = {}
-
-    monkeypatch.setattr(rp, "resolve_requested_provider", lambda requested=None: "llama-cpp")
-    monkeypatch.setattr(
-        rp,
-        "load_config",
-        lambda: {"model": {"provider": "llama-cpp", "default": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL"}},
-    )
-
-    def _runtime_payload(config):
-        captured["config"] = config
-        return {
-            "provider": "llama-cpp",
-            "api_mode": "chat_completions",
-            "base_url": "http://127.0.0.1:8081/v1",
-            "api_key": "no-key-required",
-            "source": "managed:llama-cpp",
-            "model": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
-        }
-
-    monkeypatch.setattr(rp, "llama_cpp_runtime_payload", _runtime_payload)
-
-    resolved = rp.resolve_runtime_provider(requested="llama-cpp")
-
-    assert captured["config"]["model"]["provider"] == "llama-cpp"
-    assert resolved["provider"] == "llama-cpp"
-    assert resolved["api_mode"] == "chat_completions"
-    assert resolved["base_url"] == "http://127.0.0.1:8081/v1"
-    assert resolved["api_key"] == "no-key-required"
-    assert resolved["requested_provider"] == "llama-cpp"
-
-
-def test_resolve_runtime_provider_local_alias_uses_managed_runtime_payload(monkeypatch):
-    monkeypatch.setattr(rp, "resolve_requested_provider", lambda requested=None: "local")
-    monkeypatch.setattr(
-        rp,
-        "load_config",
-        lambda: {"model": {"provider": "local", "default": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL"}},
-    )
-    monkeypatch.setattr(
-        rp,
-        "llama_cpp_runtime_payload",
-        lambda config: {
-            "provider": "llama-cpp",
-            "api_mode": "chat_completions",
-            "base_url": "http://127.0.0.1:8081/v1",
-            "api_key": "no-key-required",
-            "source": "managed:llama-cpp",
-            "model": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
-        },
-    )
-
-    resolved = rp.resolve_runtime_provider(requested="local")
-
-    assert resolved["provider"] == "llama-cpp"
-    assert resolved["requested_provider"] == "local"

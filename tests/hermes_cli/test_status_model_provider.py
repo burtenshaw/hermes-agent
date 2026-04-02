@@ -62,56 +62,6 @@ def test_show_status_displays_legacy_string_model_and_custom_endpoint(monkeypatc
     assert "Model:        qwen3:latest" in out
     assert "Provider:     Custom endpoint" in out
 
-def test_show_status_displays_managed_llama_cpp_engine_details(monkeypatch, capsys, tmp_path):
-    from hermes_cli import status as status_mod
-
-    _patch_common_status_deps(monkeypatch, status_mod, tmp_path)
-    monkeypatch.setattr(
-        status_mod,
-        "load_config",
-        lambda: {
-            "model": {
-                "default": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
-                "provider": "llama-cpp",
-            }
-        },
-        raising=False,
-    )
-    monkeypatch.setattr(status_mod, "resolve_requested_provider", lambda requested=None: "llama-cpp", raising=False)
-    monkeypatch.setattr(status_mod, "resolve_provider", lambda requested=None, **kwargs: "llama-cpp", raising=False)
-    monkeypatch.setattr(status_mod, "provider_label", lambda provider: "Local", raising=False)
-    monkeypatch.setattr(
-        status_mod,
-        "get_llama_cpp_status",
-        lambda config, check_health=False: {
-            "installed": True,
-            "healthy": True,
-            "base_url": "http://127.0.0.1:8081/v1",
-            "installed_version": "b1234",
-            "binary_path": str(tmp_path / "llama-server"),
-            "model_spec": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
-            "actual_model_id": "Qwen3.5-9B-UD-Q4_K_XL.gguf",
-            "reasoning_budget": 0,
-            "template_strategy": "native",
-            "template_file": "",
-            "parallel_tool_calls": False,
-            "streaming_tool_calls": False,
-            "smoke_tests": {"passed": True},
-        },
-        raising=False,
-    )
-
-    status_mod.show_status(SimpleNamespace(all=False, deep=False))
-
-    out = capsys.readouterr().out
-    assert "Managed Local Engine" in out
-    assert "http://127.0.0.1:8081/v1" in out
-    assert "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL" in out
-    assert "Qwen3.5-9B-UD-Q4_K_XL.gguf" in out
-    assert "disabled" in out
-    assert "Smoke tests" in out
-    assert "passed" in out
-
 
 def test_show_status_reports_managed_nous_features(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")

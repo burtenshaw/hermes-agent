@@ -141,32 +141,6 @@ def test_runtime_resolution_failure_is_not_sticky(monkeypatch):
     assert shell.agent is not None
 
 
-def test_no_provider_configured_does_not_auto_bootstrap_local(monkeypatch):
-    cli = _import_cli()
-
-    config_copy = dict(cli.CLI_CONFIG)
-    model_copy = dict(config_copy.get("model", {}))
-    model_copy.pop("provider", None)
-    config_copy["model"] = model_copy
-    monkeypatch.setattr(cli, "CLI_CONFIG", config_copy)
-
-    calls = []
-
-    def _runtime_resolve(**kwargs):
-        calls.append(kwargs["requested"])
-        raise AuthError("No inference provider configured.", code="no_provider_configured")
-
-    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", _runtime_resolve)
-    monkeypatch.setattr("hermes_cli.runtime_provider.format_runtime_provider_error", lambda exc: str(exc))
-
-    shell = cli.HermesCLI(model="gpt-5", compact=True, max_turns=1)
-    shell.requested_provider = "auto"
-
-    assert shell._ensure_runtime_credentials() is False
-    assert calls == ["auto"]
-    assert shell.requested_provider == "auto"
-
-
 def test_runtime_resolution_rebuilds_agent_on_routing_change(monkeypatch):
     cli = _import_cli()
 

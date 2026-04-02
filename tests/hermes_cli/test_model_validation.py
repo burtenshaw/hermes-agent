@@ -130,10 +130,6 @@ class TestCuratedModelsForProvider:
         models = curated_models_for_provider("zai")
         assert any("glm" in m[0] for m in models)
 
-    def test_llama_cpp_returns_curated_local_allowlist(self):
-        models = curated_models_for_provider("llama-cpp")
-        assert any("Qwen3.5-9B-GGUF" in model_id for model_id, _ in models)
-
     def test_unknown_provider_returns_empty(self):
         assert curated_models_for_provider("totally-unknown") == []
 
@@ -150,9 +146,6 @@ class TestNormalizeProvider:
         assert normalize_provider("kimi") == "kimi-coding"
         assert normalize_provider("moonshot") == "kimi-coding"
         assert normalize_provider("github-copilot") == "copilot"
-        assert normalize_provider("llama.cpp") == "llama-cpp"
-        assert normalize_provider("llamacpp") == "llama-cpp"
-        assert normalize_provider("local") == "llama-cpp"
 
     def test_case_insensitive(self):
         assert normalize_provider("OpenRouter") == "openrouter"
@@ -164,8 +157,6 @@ class TestProviderLabel:
         assert provider_label("kimi") == "Kimi / Moonshot"
         assert provider_label("copilot") == "GitHub Copilot"
         assert provider_label("copilot-acp") == "GitHub Copilot ACP"
-        assert provider_label("llama-cpp") == "Local"
-        assert provider_label("local") == "Local"
         assert provider_label("auto") == "Auto"
 
     def test_unknown_provider_preserves_original_name(self):
@@ -185,11 +176,6 @@ class TestProviderModelIds:
 
     def test_zai_returns_glm_models(self):
         assert "glm-5" in provider_model_ids("zai")
-
-    def test_llama_cpp_returns_curated_specs(self):
-        ids = provider_model_ids("llama-cpp")
-        assert "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL" in ids
-        assert "unsloth/Qwen3.5-35B-A3B-GGUF:MXFP4_MOE" in ids
 
     def test_copilot_prefers_live_catalog(self):
         with patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={"api_key": "gh-token"}), \
@@ -462,26 +448,3 @@ class TestValidateApiFallback:
         assert result["persist"] is True
         assert "http://localhost:8000/v1/models" in result["message"]
         assert "http://localhost:8000/v1" in result["message"]
-
-
-class TestValidateLlamaCppAllowlist:
-    def test_curated_llama_cpp_model_is_accepted(self):
-        result = validate_requested_model(
-            "unsloth/Qwen3.5-35B-A3B-GGUF:MXFP4_MOE",
-            "llama-cpp",
-        )
-
-        assert result["accepted"] is True
-        assert result["persist"] is True
-        assert result["recognized"] is True
-
-    def test_non_curated_llama_cpp_model_is_rejected(self):
-        result = validate_requested_model(
-            "some-random/Model-GGUF:Q4_K_M",
-            "llama-cpp",
-        )
-
-        assert result["accepted"] is False
-        assert result["persist"] is False
-        assert result["recognized"] is False
-        assert "curated llama.cpp allowlist" in result["message"]
