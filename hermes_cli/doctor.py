@@ -10,6 +10,7 @@ import subprocess
 import shutil
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
+from hermes_cli.llama_cpp import get_status as get_llama_cpp_status
 from hermes_constants import display_hermes_home
 
 PROJECT_ROOT = get_project_root()
@@ -287,6 +288,37 @@ def run_doctor(args):
         check_ok("codex CLI")
     else:
         check_warn("codex CLI not found", "(required for openai-codex login)")
+
+    # =========================================================================
+    # Check: Managed local llama.cpp engine
+    # =========================================================================
+    print()
+    print(color("◆ Managed Local Engine", Colors.CYAN, Colors.BOLD))
+
+    try:
+        from hermes_cli.config import load_config
+
+        llama_status = get_llama_cpp_status(load_config(), check_health=True)
+        if llama_status.get("installed"):
+            check_ok("llama.cpp binary", f"({llama_status.get('installed_version') or 'installed'})")
+        else:
+            check_warn("llama.cpp binary", "(not installed)")
+
+        if llama_status.get("healthy"):
+            check_ok("Managed llama.cpp server", f"({llama_status.get('base_url')})")
+        else:
+            check_warn("Managed llama.cpp server", f"(not healthy at {llama_status.get('base_url')})")
+
+        smoke = llama_status.get("smoke_tests") if isinstance(llama_status.get("smoke_tests"), dict) else {}
+        if smoke.get("passed"):
+            check_ok("Tool-calling smoke tests", "(passed)")
+        else:
+            check_warn("Tool-calling smoke tests", "(not passed)")
+            if llama_status.get("model_spec"):
+                check_info(f"Configured local model: {llama_status.get('model_spec')}")
+            issues.append("Run `hermes model` and choose `Local (managed llama.cpp model)` to (re)validate the local engine")
+    except Exception as e:
+        check_warn("Managed llama.cpp engine", f"(could not check: {e})")
 
     # =========================================================================
     # Check: Directory structure

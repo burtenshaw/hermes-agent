@@ -83,7 +83,7 @@ class ProviderConfig:
     """Describes a known inference provider."""
     id: str
     name: str
-    auth_type: str  # "oauth_device_code", "oauth_external", or "api_key"
+    auth_type: str  # "oauth_device_code", "oauth_external", "external_process", "api_key", or "managed_local"
     portal_base_url: str = ""
     inference_base_url: str = ""
     client_id: str = ""
@@ -219,6 +219,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         inference_base_url="https://router.huggingface.co/v1",
         api_key_env_vars=("HF_TOKEN",),
         base_url_env_var="HF_BASE_URL",
+    ),
+    "llama-cpp": ProviderConfig(
+        id="llama-cpp",
+        name="Local",
+        auth_type="managed_local",
+        inference_base_url="http://127.0.0.1:8081/v1",
     ),
 }
 
@@ -739,10 +745,10 @@ def resolve_provider(
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
         "go": "opencode-go", "opencode-go-sub": "opencode-go",
         "kilo": "kilocode", "kilo-code": "kilocode", "kilo-gateway": "kilocode",
-        # Local server aliases — route through the generic custom provider
+        # Local server aliases
         "lmstudio": "custom", "lm-studio": "custom", "lm_studio": "custom",
-        "ollama": "custom", "vllm": "custom", "llamacpp": "custom",
-        "llama.cpp": "custom", "llama-cpp": "custom",
+        "ollama": "custom", "vllm": "custom",
+        "llamacpp": "llama-cpp", "llama.cpp": "llama-cpp", "llama-cpp": "llama-cpp", "local": "llama-cpp",
     }
     normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
@@ -750,6 +756,8 @@ def resolve_provider(
         return "openrouter"
     if normalized == "custom":
         return "custom"
+    if normalized == "llama-cpp":
+        return "llama-cpp"
     if normalized in PROVIDER_REGISTRY:
         return normalized
     if normalized != "auto":
@@ -1940,6 +1948,13 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_codex_auth_status()
     if target == "copilot-acp":
         return get_external_process_provider_status(target)
+    if target == "llama-cpp":
+        try:
+            from hermes_cli.llama_cpp import get_managed_provider_status
+
+            return get_managed_provider_status()
+        except Exception:
+            return {"logged_in": False, "configured": False}
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":

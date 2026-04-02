@@ -1045,6 +1045,26 @@ class AIAgent:
         except Exception:
             _agent_cfg = {}
 
+        self._llama_cpp_parallel_tool_calls = False
+        self._llama_cpp_streaming_tool_calls = False
+        self._llama_cpp_parser_chain = ["qwen3_coder", "qwen", "llama3_json", "hermes"]
+        if self.provider == "llama-cpp":
+            try:
+                from hermes_cli.llama_cpp import get_engine_config, recommended_parser_chain
+
+                _llama_cfg = get_engine_config(_agent_cfg)
+                self._llama_cpp_parallel_tool_calls = bool(
+                    _llama_cfg.get("parallel_tool_calls", False)
+                )
+                self._llama_cpp_streaming_tool_calls = bool(
+                    _llama_cfg.get("streaming_tool_calls", False)
+                )
+                self._llama_cpp_parser_chain = list(
+                    recommended_parser_chain(_agent_cfg)
+                )
+            except Exception:
+                pass
+
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
         self._memory_enabled = False
@@ -4916,6 +4936,51 @@ class AIAgent:
         base = (getattr(self, "base_url", "") or "").lower()
         return "dashscope" in base or "aliyuncs" in base
 
+    def _is_llama_cpp_provider(self) -> bool:
+        return (getattr(self, "provider", "") or "").lower() == "llama-cpp"
+
+    def _ensure_tool_call_ids(self, tool_calls: list) -> list:
+        """Assign deterministic ids to tool calls that arrive without one."""
+        normalized = []
+        for idx, tool_call in enumerate(tool_calls or []):
+            raw_id = getattr(tool_call, "id", None)
+            if not isinstance(raw_id, str) or not raw_id.strip():
+                fn = getattr(tool_call, "function", None)
+                fn_name = getattr(fn, "name", "") if fn else ""
+                fn_args = getattr(fn, "arguments", "{}") if fn else "{}"
+                setattr(tool_call, "id", self._deterministic_call_id(fn_name, fn_args, idx))
+            normalized.append(tool_call)
+        return normalized
+
+    def _maybe_parse_llama_cpp_tool_calls(self, assistant_message):
+        """Recover structured tool calls from llama.cpp text fallbacks."""
+        if not self._is_llama_cpp_provider():
+            return assistant_message
+        if getattr(assistant_message, "tool_calls", None):
+            assistant_message.tool_calls = self._ensure_tool_call_ids(assistant_message.tool_calls)
+            return assistant_message
+
+        content = getattr(assistant_message, "content", None)
+        if not isinstance(content, str) or not content.strip():
+            return assistant_message
+
+        try:
+            from environments.tool_call_parsers import get_parser
+        except Exception:
+            return assistant_message
+
+        for parser_name in self._llama_cpp_parser_chain:
+            try:
+                parsed_content, parsed_tool_calls = get_parser(parser_name).parse(content)
+            except Exception:
+                continue
+            if not parsed_tool_calls:
+                continue
+            assistant_message.content = parsed_content
+            assistant_message.tool_calls = self._ensure_tool_call_ids(list(parsed_tool_calls))
+            return assistant_message
+        return assistant_message
+
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
         if self.api_mode == "anthropic_messages":
@@ -5061,6 +5126,8 @@ class AIAgent:
         }
         if self.tools:
             api_kwargs["tools"] = self.tools
+            if self._is_llama_cpp_provider():
+                api_kwargs["parallel_tool_calls"] = bool(self._llama_cpp_parallel_tool_calls)
 
         if self.max_tokens is not None:
             api_kwargs.update(self._max_tokens_param(self.max_tokens))
@@ -6868,6 +6935,13 @@ class AIAgent:
                         from unittest.mock import Mock
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
+                    if (
+                        _use_streaming
+                        and self._is_llama_cpp_provider()
+                        and self.tools
+                        and not self._llama_cpp_streaming_tool_calls
+                    ):
+                        _use_streaming = False
 
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(
@@ -7823,6 +7897,13 @@ class AIAgent:
                         assistant_message.content = "\n".join(parts)
                     else:
                         assistant_message.content = str(raw)
+
+                if self._is_llama_cpp_provider():
+                    if finish_reason == "tool":
+                        finish_reason = "tool_calls"
+                    assistant_message = self._maybe_parse_llama_cpp_tool_calls(assistant_message)
+                    if getattr(assistant_message, "tool_calls", None):
+                        finish_reason = "tool_calls"
 
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:

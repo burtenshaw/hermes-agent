@@ -246,6 +246,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
 
 _PROVIDER_LABELS = {
     "openrouter": "OpenRouter",
+    "llama-cpp": "Local",
     "openai-codex": "OpenAI Codex",
     "copilot-acp": "GitHub Copilot ACP",
     "nous": "Nous Portal",
@@ -300,6 +301,9 @@ _PROVIDER_ALIASES = {
     "hf": "huggingface",
     "hugging-face": "huggingface",
     "huggingface-hub": "huggingface",
+    "llamacpp": "llama-cpp",
+    "llama.cpp": "llama-cpp",
+    "local": "llama-cpp",
 }
 
 
@@ -332,7 +336,7 @@ def list_available_providers() -> list[dict[str, str]]:
     """
     # Canonical providers in display order
     _PROVIDER_ORDER = [
-        "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
+        "openrouter", "llama-cpp", "nous", "openai-codex", "copilot", "copilot-acp",
         "huggingface", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "anthropic", "alibaba",
         "opencode-zen", "opencode-go",
         "ai-gateway", "deepseek", "custom",
@@ -428,6 +432,10 @@ def curated_models_for_provider(provider: Optional[str]) -> list[tuple[str, str]
     normalized = normalize_provider(provider)
     if normalized == "openrouter":
         return list(OPENROUTER_MODELS)
+    if normalized == "llama-cpp":
+        from hermes_cli.llama_cpp import curated_model_specs
+
+        return [(spec, "") for spec in curated_model_specs()]
 
     # Try live API first (Codex, Nous, etc. all support /models)
     live = provider_model_ids(normalized)
@@ -468,7 +476,7 @@ def detect_provider_for_model(
     # openrouter requires an explicit model name to be useful.
     resolved_provider = _PROVIDER_ALIASES.get(name_lower, name_lower)
     if resolved_provider not in {"custom", "openrouter"}:
-        default_models = _PROVIDER_MODELS.get(resolved_provider, [])
+        default_models = provider_model_ids(resolved_provider)
         if (
             resolved_provider in _PROVIDER_LABELS
             and default_models
@@ -486,7 +494,11 @@ def detect_provider_for_model(
 
     # --- Step 1: check static provider catalogs for a direct match ---
     direct_match: Optional[str] = None
-    for pid, models in _PROVIDER_MODELS.items():
+    catalog_items = list(_PROVIDER_MODELS.items())
+    if "llama-cpp" not in _PROVIDER_MODELS:
+        catalog_items.append(("llama-cpp", provider_model_ids("llama-cpp")))
+
+    for pid, models in catalog_items:
         if pid == current_provider or pid in _AGGREGATORS:
             continue
         if any(name_lower == m.lower() for m in models):
@@ -601,6 +613,10 @@ def provider_model_ids(provider: Optional[str]) -> list[str]:
     normalized = normalize_provider(provider)
     if normalized == "openrouter":
         return model_ids()
+    if normalized == "llama-cpp":
+        from hermes_cli.llama_cpp import curated_model_specs
+
+        return curated_model_specs()
     if normalized == "openai-codex":
         from hermes_cli.codex_models import get_codex_model_ids
 
@@ -1123,6 +1139,31 @@ def validate_requested_model(
     normalized = normalize_provider(provider)
     if normalized == "openrouter" and base_url and "openrouter.ai" not in base_url:
         normalized = "custom"
+    if normalized == "llama-cpp":
+        from hermes_cli.llama_cpp import curated_model_specs
+
+        curated = set(curated_model_specs())
+        if requested in curated:
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+        suggestion_text = ""
+        suggestions = get_close_matches(requested, sorted(curated), n=3, cutoff=0.4)
+        if suggestions:
+            suggestion_text = "\n  Supported models: " + ", ".join(f"`{s}`" for s in suggestions)
+        return {
+            "accepted": False,
+            "persist": False,
+            "recognized": False,
+            "message": (
+                f"`{requested}` is not in Hermes' curated llama.cpp allowlist. "
+                "Managed llama.cpp only supports vetted local models for reliable tool calling."
+                f"{suggestion_text}"
+            ),
+        }
     requested_for_lookup = requested
     if normalized == "copilot":
         requested_for_lookup = normalize_copilot_model_id(

@@ -407,7 +407,6 @@ def test_setup_switch_preserves_non_model_config(tmp_path, monkeypatch):
     assert reloaded["terminal"]["timeout"] == 999
     assert reloaded["model"]["provider"] == "openrouter"
 
-
 def test_setup_summary_marks_anthropic_auth_as_vision_available(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _clear_provider_env(monkeypatch)
@@ -475,3 +474,38 @@ def test_setup_summary_does_not_mark_incomplete_browserbase_as_available(tmp_pat
     assert "Browser Automation (Browserbase)" not in output
     assert "Browser Automation" in output
     assert "BROWSERBASE_API_KEY/BROWSERBASE_PROJECT_ID" in output
+
+
+def test_setup_syncs_local_engines_written_by_shared_model_flow(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+    _stub_tts(monkeypatch)
+
+    config = load_config()
+
+    def fake_select():
+        cfg = load_config()
+        cfg["model"] = {
+            "provider": "llama-cpp",
+            "default": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
+            "base_url": "http://127.0.0.1:8081/v1",
+            "api_mode": "chat_completions",
+        }
+        cfg["local_engines"] = {
+            "llama_cpp": {
+                "managed": True,
+                "selected_tier": "balanced",
+                "model_repo": "unsloth/Qwen3.5-9B-GGUF",
+                "quant": "UD-Q4_K_XL",
+                "parallel_tool_calls": False,
+                "streaming_tool_calls": False,
+            }
+        }
+        save_config(cfg)
+
+    monkeypatch.setattr("hermes_cli.main.select_provider_and_model", fake_select)
+
+    setup_model_provider(config)
+
+    assert config["model"]["provider"] == "llama-cpp"
+    assert config["local_engines"]["llama_cpp"]["selected_tier"] == "balanced"

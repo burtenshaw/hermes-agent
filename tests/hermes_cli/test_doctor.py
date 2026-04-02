@@ -136,3 +136,78 @@ def test_check_gateway_service_linger_skips_when_service_not_installed(monkeypat
     out = capsys.readouterr().out
     assert out == ""
     assert issues == []
+
+
+def test_run_doctor_reports_managed_llama_cpp_smoke_failure(monkeypatch, tmp_path):
+    project_root = tmp_path / "project"
+    hermes_home = tmp_path / ".hermes"
+    project_root.mkdir()
+    hermes_home.mkdir()
+    (hermes_home / ".env").write_text("", encoding="utf-8")
+    (hermes_home / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+    (hermes_home / "skills").mkdir()
+
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project_root)
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", hermes_home)
+    monkeypatch.setattr(doctor_mod, "_DHH", "~/.hermes")
+    monkeypatch.setattr(doctor_mod.shutil, "which", lambda _cmd: None)
+    monkeypatch.setattr(doctor_mod, "_check_gateway_service_linger", lambda issues: None)
+    monkeypatch.setattr(
+        doctor_mod,
+        "get_llama_cpp_status",
+        lambda *_args, **_kwargs: {
+            "installed": True,
+            "installed_version": "b1234",
+            "healthy": True,
+            "base_url": "http://127.0.0.1:8081/v1",
+            "model_spec": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
+            "smoke_tests": {"passed": False},
+        },
+    )
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda _key: "")
+    monkeypatch.setattr(
+        "honcho_integration.client.HonchoClientConfig.from_global_config",
+        lambda: SimpleNamespace(
+            enabled=False,
+            api_key="",
+            base_url="",
+            workspace_id="",
+            memory_mode="session",
+            write_frequency="on_exit",
+        ),
+    )
+    monkeypatch.setattr(
+        "honcho_integration.client.resolve_config_path",
+        lambda: hermes_home / "missing-honcho.yaml",
+    )
+    monkeypatch.setattr("hermes_cli.profiles.list_profiles", lambda: [])
+    monkeypatch.setitem(
+        sys.modules,
+        "model_tools",
+        types.SimpleNamespace(
+            check_tool_availability=lambda: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        ),
+    )
+
+    events = []
+    monkeypatch.setattr(
+        doctor_mod,
+        "check_ok",
+        lambda text, detail="": events.append(("ok", text, detail)),
+    )
+    monkeypatch.setattr(
+        doctor_mod,
+        "check_warn",
+        lambda text, detail="": events.append(("warn", text, detail)),
+    )
+    monkeypatch.setattr(
+        doctor_mod,
+        "check_info",
+        lambda text: events.append(("info", text, "")),
+    )
+
+    doctor_mod.run_doctor(Namespace(fix=False))
+
+    assert ("warn", "Tool-calling smoke tests", "(not passed)") in events
+    assert ("info", "Configured local model: unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL", "") in events

@@ -430,6 +430,23 @@ DEFAULT_CONFIG = {
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
     },
 
+    "local_engines": {
+        "llama_cpp": {
+            "managed": True,
+            "auto_start": True,
+            "port": 8081,
+            "selected_tier": "",
+            "model_repo": "",
+            "quant": "",
+            "context_length": 32768,
+            "reasoning_budget": 0,
+            "template_strategy": "native",
+            "template_file": "",
+            "parallel_tool_calls": False,
+            "streaming_tool_calls": False,
+        },
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all
@@ -519,7 +536,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 11,
+    "_config_version": 15,
 }
 
 # =============================================================================
@@ -1471,6 +1488,64 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
     return config
 
 
+def _normalize_llama_cpp_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Canonicalize dedicated llama.cpp provider config."""
+    from hermes_cli.llama_cpp import LLAMA_CPP_DEFAULT_PORT, is_llama_cpp_provider
+
+    config = dict(config)
+    raw_model_cfg = config.get("model")
+    preserve_string_model = isinstance(raw_model_cfg, str) and bool(raw_model_cfg.strip())
+    if isinstance(raw_model_cfg, dict):
+        model_cfg = dict(raw_model_cfg)
+    elif preserve_string_model:
+        model_cfg = {"default": raw_model_cfg.strip()}
+    else:
+        model_cfg = {}
+
+    provider = str(model_cfg.get("provider") or "").strip().lower()
+    base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
+
+    if is_llama_cpp_provider(provider):
+        model_cfg["provider"] = "llama-cpp"
+
+    local_engines = config.get("local_engines")
+    if not isinstance(local_engines, dict):
+        local_engines = {}
+    llama_cfg = local_engines.get("llama_cpp")
+    if not isinstance(llama_cfg, dict):
+        llama_cfg = {}
+    else:
+        llama_cfg = dict(llama_cfg)
+        for obsolete_key in ("selection_backend", "profile", "model_path"):
+            llama_cfg.pop(obsolete_key, None)
+        local_engines["llama_cpp"] = llama_cfg
+    managed = bool(llama_cfg.get("managed", DEFAULT_CONFIG["local_engines"]["llama_cpp"]["managed"]))
+    try:
+        managed_port = int(llama_cfg.get("port") or LLAMA_CPP_DEFAULT_PORT)
+    except Exception:
+        managed_port = LLAMA_CPP_DEFAULT_PORT
+
+    managed_urls = {
+        f"http://127.0.0.1:{managed_port}/v1",
+        f"http://localhost:{managed_port}/v1",
+        f"http://0.0.0.0:{managed_port}/v1",
+    }
+    if provider == "custom" and managed and base_url in managed_urls:
+        model_cfg["provider"] = "llama-cpp"
+
+    if isinstance(raw_model_cfg, dict):
+        config["model"] = model_cfg
+    elif preserve_string_model:
+        config["model"] = raw_model_cfg.strip()
+    elif model_cfg:
+        config["model"] = model_cfg
+    else:
+        config["model"] = config.get("model", {})
+    if local_engines:
+        config["local_engines"] = local_engines
+    return config
+
+
 
 def load_config() -> Dict[str, Any]:
     """Load configuration from ~/.hermes/config.yaml."""
@@ -1496,7 +1571,9 @@ def load_config() -> Dict[str, Any]:
         except Exception as e:
             print(f"Warning: Failed to load config: {e}")
     
-    return _expand_env_vars(_normalize_root_model_keys(_normalize_max_turns_config(config)))
+    normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    normalized = _normalize_llama_cpp_config(normalized)
+    return _expand_env_vars(normalized)
 
 
 _SECURITY_COMMENT = """
@@ -1604,6 +1681,7 @@ def save_config(config: Dict[str, Any]):
     ensure_hermes_home()
     config_path = get_config_path()
     normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
+    normalized = _normalize_llama_cpp_config(normalized)
 
     # Build optional commented-out sections for features that are off by
     # default or only relevant when explicitly configured.

@@ -903,6 +903,8 @@ def setup_model_provider(config: dict):
     config["model"] = _refreshed.get("model", config.get("model"))
     if _refreshed.get("custom_providers"):
         config["custom_providers"] = _refreshed["custom_providers"]
+    if _refreshed.get("local_engines"):
+        config["local_engines"] = _refreshed["local_engines"]
 
     # Derive the selected provider for downstream steps (vision setup).
     selected_provider = None

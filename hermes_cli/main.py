@@ -860,8 +860,12 @@ def cmd_model(args):
     _require_tty("model")
     select_provider_and_model(args=args)
 
-
-def select_provider_and_model(args=None):
+def select_provider_and_model(
+    args=None,
+    *,
+    preferred_provider: str | None = None,
+    skip_provider_prompt: bool = False,
+):
     """Core provider selection + model picking logic.
 
     Shared by ``cmd_model`` (``hermes model``) and the setup wizard
@@ -908,6 +912,7 @@ def select_provider_and_model(args=None):
         active = "custom"
 
     provider_labels = {
+        "llama-cpp": "Local",
         "openrouter": "OpenRouter",
         "nous": "Nous Portal",
         "openai-codex": "OpenAI Codex",
@@ -935,6 +940,7 @@ def select_provider_and_model(args=None):
 
     # Step 1: Provider selection — put active provider first with marker
     providers = [
+        ("local", "Local (managed llama.cpp model)"),
         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
         ("nous", "Nous Portal (Nous Research subscription)"),
         ("openai-codex", "OpenAI Codex"),
@@ -986,7 +992,10 @@ def select_provider_and_model(args=None):
 
     # Reorder so the active provider is at the top
     known_keys = {k for k, _ in providers}
-    active_key = active if active in known_keys else "custom"
+    if active == "llama-cpp" and "local" in known_keys:
+        active_key = "local"
+    else:
+        active_key = active if active in known_keys else "custom"
     ordered = []
     for key, label in providers:
         if key == active_key:
@@ -995,15 +1004,20 @@ def select_provider_and_model(args=None):
             ordered.append((key, label))
     ordered.append(("cancel", "Cancel"))
 
-    provider_idx = _prompt_provider_choice([label for _, label in ordered])
-    if provider_idx is None or ordered[provider_idx][0] == "cancel":
-        print("No change.")
-        return
-
-    selected_provider = ordered[provider_idx][0]
+    selected_provider = None
+    if skip_provider_prompt and preferred_provider:
+        selected_provider = preferred_provider
+    else:
+        provider_idx = _prompt_provider_choice([label for _, label in ordered])
+        if provider_idx is None or ordered[provider_idx][0] == "cancel":
+            print("No change.")
+            return
+        selected_provider = ordered[provider_idx][0]
 
     # Step 2: Provider-specific setup + model selection
-    if selected_provider == "openrouter":
+    if selected_provider in {"llama-cpp", "local"}:
+        _model_flow_llama_cpp(config, current_model)
+    elif selected_provider == "openrouter":
         _model_flow_openrouter(config, current_model)
     elif selected_provider == "nous":
         _model_flow_nous(config, current_model, args=args)
@@ -1064,6 +1078,110 @@ def _prompt_provider_choice(choices):
         except (KeyboardInterrupt, EOFError):
             print()
             return None
+
+def _model_flow_llama_cpp(config, current_model=""):
+    """Managed local llama.cpp flow.
+
+    Installs/uses a managed llama.cpp binary, selects a vetted local model tier,
+    starts the server, runs smoke tests, and persists the resulting provider
+    selection as ``llama-cpp``.
+    """
+    from hermes_cli.auth import deactivate_provider
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.llama_cpp import (
+        configure_selected_model,
+        curated_entry_for_tier,
+        ensure_runtime_ready,
+        get_status,
+        spec_string,
+        sync_config_model_fields,
+    )
+
+    fresh_config = load_config()
+    current_status = get_status(fresh_config, check_health=False)
+    current_spec = current_status.get("model_spec") or ""
+
+    print("Managed local setup:")
+    if current_spec:
+        print(f"  Current local:   {current_spec}")
+    print()
+
+    options = []
+    option_keys = []
+    if current_spec:
+        options.append(f"Keep current ({current_spec})")
+        option_keys.append(("current", current_status.get("selected_tier") or "balanced"))
+
+    for tier in ("tiny", "balanced", "large"):
+        entry = curated_entry_for_tier(tier)
+        label = f"{tier.capitalize()} — {spec_string(entry['model_repo'], entry['quant'])}"
+        if tier == "balanced":
+            label += "  ← default"
+        options.append(label)
+        option_keys.append(("tier", tier))
+
+    options.append("Cancel")
+    option_keys.append(("cancel", ""))
+
+    choice = _prompt_provider_choice(options)
+    if choice is None:
+        print("No change.")
+        return
+
+    action, tier = option_keys[choice]
+    if action == "cancel":
+        print("No change.")
+        return
+
+    selected_tier = tier
+    if action == "current" and current_status.get("selected_tier"):
+        selected_tier = str(current_status["selected_tier"])
+
+    working = load_config()
+    working = configure_selected_model(working, tier=selected_tier)
+
+    local_engines = working.setdefault("local_engines", {})
+    if not isinstance(local_engines, dict):
+        local_engines = {}
+        working["local_engines"] = local_engines
+    llama_cfg = local_engines.setdefault("llama_cpp", {})
+    if not isinstance(llama_cfg, dict):
+        llama_cfg = {}
+        local_engines["llama_cpp"] = llama_cfg
+
+    print()
+    print("Installing / starting managed llama.cpp. This can take a while on first use.")
+    try:
+        runtime = ensure_runtime_ready(working)
+    except Exception as exc:
+        print(f"llama.cpp setup failed: {exc}")
+        return
+
+    smoke = runtime.get("smoke_tests") if isinstance(runtime.get("smoke_tests"), dict) else {}
+    if smoke.get("parallel_tool_calls"):
+        llama_cfg["parallel_tool_calls"] = True
+    else:
+        llama_cfg["parallel_tool_calls"] = False
+    llama_cfg["streaming_tool_calls"] = False
+
+    working = sync_config_model_fields(working, runtime)
+    save_config(working)
+    deactivate_provider()
+
+    # Sync caller state so setup wizard final save preserves the changes.
+    config["model"] = dict(working.get("model") or {})
+    if working.get("local_engines"):
+        config["local_engines"] = working["local_engines"]
+
+    selected_model = working.get("model", {}).get("default") if isinstance(working.get("model"), dict) else current_model
+    print(f"Default model set to: {selected_model} (via managed llama.cpp)")
+    print(f"  Endpoint: {runtime.get('base_url')}")
+    if runtime.get("installed_version"):
+        print(f"  Binary:   {runtime.get('installed_version')}")
+    if smoke.get("passed"):
+        print("  Smoke tests: passed")
+    else:
+        print("  Smoke tests: not passed")
 
 
 def _model_flow_openrouter(config, current_model=""):

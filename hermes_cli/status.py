@@ -14,6 +14,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 from hermes_cli.auth import AuthError, resolve_provider
 from hermes_cli.colors import Colors, color
 from hermes_cli.config import get_env_path, get_env_value, get_hermes_home, load_config
+from hermes_cli.llama_cpp import get_status as get_llama_cpp_status
 from hermes_cli.models import provider_label
 from hermes_cli.nous_subscription import get_nous_subscription_features
 from hermes_cli.runtime_provider import resolve_requested_provider
@@ -107,7 +108,54 @@ def show_status(args):
 
     print(f"  Model:        {_configured_model_label(config)}")
     print(f"  Provider:     {_effective_provider_label()}")
-    
+
+    # =========================================================================
+    # Managed Local Engine
+    # =========================================================================
+    print()
+    print(color("◆ Managed Local Engine", Colors.CYAN, Colors.BOLD))
+    try:
+        llama_status = get_llama_cpp_status(config, check_health=deep)
+        installed = bool(llama_status.get("installed"))
+        healthy = bool(llama_status.get("healthy"))
+        smoke = llama_status.get("smoke_tests") if isinstance(llama_status.get("smoke_tests"), dict) else {}
+        smoke_passed = bool(smoke.get("passed"))
+
+        print(
+            f"  {'llama.cpp':<12}  "
+            f"{check_mark(healthy or installed)} "
+            f"{'healthy' if healthy else ('installed' if installed else 'not installed')}"
+        )
+        print(f"  {'Endpoint':<12}  {llama_status.get('base_url')}")
+        if llama_status.get("installed_version"):
+            print(f"  {'Version':<12}  {llama_status.get('installed_version')}")
+        if llama_status.get("binary_path"):
+            print(f"  {'Binary':<12}  {llama_status.get('binary_path')}")
+        print(f"  {'Model spec':<12}  {llama_status.get('model_spec')}")
+        if llama_status.get("actual_model_id"):
+            print(f"  {'Loaded model':<12}  {llama_status.get('actual_model_id')}")
+        print(f"  {'Thinking':<12}  {'disabled' if int(llama_status.get('reasoning_budget', 0)) == 0 else llama_status.get('reasoning_budget')}")
+        print(
+            f"  {'Template':<12}  "
+            f"{llama_status.get('template_strategy')}"
+            + (
+                f" ({llama_status.get('template_file')})"
+                if llama_status.get("template_strategy") == "override" and llama_status.get("template_file")
+                else ""
+            )
+        )
+        print(f"  {'Smoke tests':<12}  {check_mark(smoke_passed)} {'passed' if smoke_passed else 'not passed'}")
+        print(
+            f"  {'Parallel':<12}  "
+            f"{'enabled' if llama_status.get('parallel_tool_calls') else 'disabled'}"
+        )
+        print(
+            f"  {'Streaming':<12}  "
+            f"{'enabled' if llama_status.get('streaming_tool_calls') else 'disabled'}"
+        )
+    except Exception as exc:
+        print(f"  {'llama.cpp':<12}  {check_mark(False)} unavailable ({exc})")
+
     # =========================================================================
     # API Keys
     # =========================================================================
