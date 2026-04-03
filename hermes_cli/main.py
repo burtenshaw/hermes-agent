@@ -1253,9 +1253,7 @@ def _model_flow_llama_cpp(config, current_model=""):
         if not isinstance(llama_cfg, dict):
             llama_cfg = {}
             local_engines["llama_cpp"] = llama_cfg
-        llama_cfg["model_repo"] = selected_repo
-        llama_cfg["quant"] = quant
-        llama_cfg["selected_tier"] = ""
+        llama_cfg["model"] = spec_string(selected_repo, quant)
         llama_cfg["context_length"] = 0
     elif action == "custom":
         try:
@@ -1279,9 +1277,7 @@ def _model_flow_llama_cpp(config, current_model=""):
         if not isinstance(llama_cfg, dict):
             llama_cfg = {}
             local_engines["llama_cpp"] = llama_cfg
-        llama_cfg["model_repo"] = parsed["model_repo"]
-        llama_cfg["quant"] = parsed.get("quant", "")
-        llama_cfg["selected_tier"] = ""
+        llama_cfg["model"] = spec_string(parsed["model_repo"], parsed.get("quant", ""))
         llama_cfg["context_length"] = 0
     else:
         working = configure_selected_model(working, tier=tier)
@@ -1294,6 +1290,8 @@ def _model_flow_llama_cpp(config, current_model=""):
     if not isinstance(llama_cfg, dict):
         llama_cfg = {}
         local_engines["llama_cpp"] = llama_cfg
+    for legacy_key in ("selected_tier", "model_repo", "quant"):
+        llama_cfg.pop(legacy_key, None)
 
     print()
     print("Installing / starting managed llama.cpp. This can take a while on first use.")

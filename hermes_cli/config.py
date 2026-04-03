@@ -440,11 +440,10 @@ DEFAULT_CONFIG = {
             "managed": True,
             "auto_start": True,
             "port": 8081,
-            "selected_tier": "",
-            "model_repo": "",
-            "quant": "",
-            "context_length": 32768,
+            "model": "",
+            "context_length": 0,
             "reasoning_budget": 0,
+            "reasoning_format": "deepseek",
             "template_strategy": "native",
             "template_file": "",
             "parallel_tool_calls": False,
@@ -1495,7 +1494,12 @@ def _normalize_max_turns_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_llama_cpp_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Canonicalize dedicated llama.cpp provider config."""
-    from hermes_cli.llama_cpp import LLAMA_CPP_DEFAULT_PORT, is_llama_cpp_provider
+    from hermes_cli.llama_cpp import (
+        LLAMA_CPP_DEFAULT_PORT,
+        canonical_model_value,
+        is_llama_cpp_provider,
+        spec_string,
+    )
 
     config = dict(config)
     raw_model_cfg = config.get("model")
@@ -1521,10 +1525,29 @@ def _normalize_llama_cpp_config(config: Dict[str, Any]) -> Dict[str, Any]:
         llama_cfg = {}
     else:
         llama_cfg = dict(llama_cfg)
-        for obsolete_key in ("selection_backend", "profile", "model_path"):
-            llama_cfg.pop(obsolete_key, None)
         if llama_cfg.get("reasoning_budget") == -1:
             llama_cfg["reasoning_budget"] = 0
+        raw_engine_model = str(llama_cfg.get("model") or "").strip()
+        if not raw_engine_model:
+            legacy_tier = str(llama_cfg.get("selected_tier") or "").strip().lower()
+            if legacy_tier:
+                raw_engine_model = legacy_tier
+            else:
+                raw_engine_model = spec_string(llama_cfg.get("model_repo"), llama_cfg.get("quant"))
+        normalized_model = canonical_model_value(raw_engine_model)
+        if normalized_model:
+            llama_cfg["model"] = normalized_model
+        else:
+            llama_cfg.pop("model", None)
+        for obsolete_key in (
+            "selection_backend",
+            "profile",
+            "model_path",
+            "selected_tier",
+            "model_repo",
+            "quant",
+        ):
+            llama_cfg.pop(obsolete_key, None)
         local_engines["llama_cpp"] = llama_cfg
     managed = bool(llama_cfg.get("managed", DEFAULT_CONFIG["local_engines"]["llama_cpp"]["managed"]))
     try:

@@ -60,13 +60,9 @@ _HF_SEARCH_DEFAULT_PIPELINE_TAG = "image-text-to-text"
 _HF_SEARCH_DEFAULT_NUM_PARAMETERS = "min:0,max:32B"
 _GGUF_SHARD_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
 _PREFERRED_QUANTS = (
-    "UD-Q4_K_M",
     "Q4_K_M",
-    "UD-Q4_K_XL",
-    "Q4_K_XL",
-    "MXFP4_MOE",
-    "Q8_0",
     "Q6_K",
+    "Q8_0",
     "F16",
     "BF16",
 )
@@ -118,11 +114,10 @@ def default_engine_config() -> Dict[str, Any]:
         "managed": True,
         "auto_start": True,
         "port": LLAMA_CPP_DEFAULT_PORT,
-        "selected_tier": "",
-        "model_repo": "",
-        "quant": "",
+        "model": "",
         "context_length": 0,
         "reasoning_budget": 0,
+        "reasoning_format": "deepseek",
         "template_strategy": "native",
         "template_file": "",
         "parallel_tool_calls": True,
@@ -223,7 +218,15 @@ def get_engine_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
             candidate = local_engines.get("llama_cpp")
             if isinstance(candidate, dict):
                 engine_cfg = candidate
-        elif any(key in config for key in default_engine_config().keys()):
+        elif any(
+            key in config
+            for key in (
+                *default_engine_config().keys(),
+                "selected_tier",
+                "model_repo",
+                "quant",
+            )
+        ):
             engine_cfg = config
     merged = _merge_dict(default_engine_config(), engine_cfg)
     try:
@@ -242,11 +245,23 @@ def get_engine_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         merged["reasoning_budget"] = int(merged.get("reasoning_budget"))
     except Exception:
         merged["reasoning_budget"] = 0
+    merged["reasoning_format"] = str(merged.get("reasoning_format") or "deepseek").strip().lower() or "deepseek"
     merged["selected_tier"] = str(merged.get("selected_tier") or "").strip().lower()
     merged["template_strategy"] = str(merged.get("template_strategy") or "native").strip().lower()
     merged["template_file"] = str(merged.get("template_file") or "").strip()
     merged["model_repo"] = str(merged.get("model_repo") or "").strip()
     merged["quant"] = str(merged.get("quant") or "").strip()
+    merged["model"] = canonical_model_value(merged.get("model"))
+    if not merged["model"]:
+        if merged["selected_tier"] in CURATED_MODELS:
+            merged["model"] = merged["selected_tier"]
+        else:
+            merged["model"] = spec_string(merged["model_repo"], merged["quant"])
+    resolved_model = _resolve_model_value(merged["model"])
+    merged["model"] = resolved_model["model"]
+    merged["selected_tier"] = resolved_model["selected_tier"]
+    merged["model_repo"] = resolved_model["model_repo"]
+    merged["quant"] = resolved_model["quant"]
     merged["managed"] = bool(merged.get("managed", True))
     merged["auto_start"] = bool(merged.get("auto_start", True))
     merged["parallel_tool_calls"] = bool(merged.get("parallel_tool_calls", False))
@@ -273,6 +288,43 @@ def parse_model_spec(value: Optional[str]) -> Dict[str, str]:
         return {"model_repo": text, "quant": ""}
     repo, quant = text.rsplit(":", 1)
     return {"model_repo": repo.strip(), "quant": quant.strip()}
+
+
+def canonical_model_value(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    normalized = text.lower()
+    if normalized in CURATED_MODELS:
+        return normalized
+    parsed = parse_model_spec(text)
+    return spec_string(parsed.get("model_repo", ""), parsed.get("quant", ""))
+
+
+def _resolve_model_value(value: Optional[str]) -> Dict[str, str]:
+    canonical = canonical_model_value(value)
+    resolved = {
+        "model": canonical,
+        "selected_tier": "",
+        "model_repo": "",
+        "quant": "",
+    }
+    if not canonical:
+        return resolved
+    if canonical in CURATED_MODELS:
+        entry = CURATED_MODELS[canonical]
+        resolved["selected_tier"] = canonical
+        resolved["model_repo"] = str(entry.get("model_repo") or "").strip()
+        resolved["quant"] = str(entry.get("quant") or "").strip()
+        return resolved
+
+    parsed = parse_model_spec(canonical)
+    resolved["model_repo"] = parsed.get("model_repo", "")
+    resolved["quant"] = parsed.get("quant", "")
+    curated = _CURATED_SPECS.get(canonical)
+    if curated:
+        resolved["selected_tier"] = str(curated.get("tier") or "").strip().lower()
+    return resolved
 
 
 def curated_model_specs() -> list[str]:
@@ -434,14 +486,6 @@ def effective_reasoning_budget(config: Optional[Dict[str, Any]] = None) -> int:
         return max(0, budget)
     except Exception:
         return 0
-
-
-def effective_reasoning_format(config: Optional[Dict[str, Any]] = None) -> str:
-    # Always use "deepseek" — with budget 0, thinking is suppressed but
-    # llama-server still correctly parses the model's native thinking/tool-call
-    # tokens.  "none" causes parsing failures when models inject thinking
-    # channel markers before tool calls (e.g. Gemma 4).
-    return "deepseek"
 
 
 def binary_candidates() -> list[Path]:
@@ -1505,9 +1549,12 @@ def configure_selected_model(
     curated = curated_entry_for_tier(tier)
     engine_cfg["managed"] = True
     engine_cfg["auto_start"] = True
-    engine_cfg["selected_tier"] = tier
-    engine_cfg["model_repo"] = model_repo or curated["model_repo"]
-    engine_cfg["quant"] = quant or curated["quant"]
+    selected_model = (
+        spec_string(model_repo or curated["model_repo"], quant or curated["quant"])
+        if (model_repo or quant)
+        else tier
+    )
+    engine_cfg["model"] = canonical_model_value(selected_model)
     engine_cfg["context_length"] = int(context_length or curated.get("context_length") or _DEFAULT_CONTEXT_LENGTH)
     if "reasoning_budget" in engine_cfg:
         try:
@@ -1517,6 +1564,8 @@ def configure_selected_model(
     else:
         engine_cfg["reasoning_budget"] = 0
     engine_cfg["template_strategy"] = curated.get("template_strategy", "native")
+    for legacy_key in ("selected_tier", "model_repo", "quant"):
+        engine_cfg.pop(legacy_key, None)
     return config
 
 

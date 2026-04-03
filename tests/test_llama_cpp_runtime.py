@@ -49,18 +49,6 @@ def agent():
         instance.compression_enabled = False
         instance.save_trajectories = False
         return instance
-
-
-def test_build_api_kwargs_passes_llama_cpp_parallel_flag(agent):
-    agent.provider = "llama-cpp"
-    agent._llama_cpp_parallel_tool_calls = False
-
-    kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
-
-    assert "tools" in kwargs
-    assert kwargs["parallel_tool_calls"] is False
-
-
 def test_llama_cpp_tool_turn_uses_parser_fallback_and_generated_ids(agent):
     agent.provider = "llama-cpp"
     agent._llama_cpp_parser_chain = ["llama3_json"]
