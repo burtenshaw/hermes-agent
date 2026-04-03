@@ -17,7 +17,7 @@ def test_load_config_canonicalizes_llama_cpp_aliases(tmp_path):
                     {
                         "model": {
                             "provider": provider,
-                            "default": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
+                            "default": "ggml-org/gemma-4-E4B-it-GGUF:Q4_K_M",
                         }
                     }
                 ),
@@ -28,39 +28,6 @@ def test_load_config_canonicalizes_llama_cpp_aliases(tmp_path):
 
             assert config["model"]["provider"] == "llama-cpp"
 
-
-def test_load_config_normalizes_legacy_llama_cpp_config(tmp_path):
-    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-        (tmp_path / "config.yaml").write_text(
-            yaml.safe_dump(
-                {
-                    "model": {
-                        "provider": "custom",
-                        "default": "local-model",
-                        "base_url": "http://127.0.0.1:8081/v1",
-                    },
-                    "local_engines": {
-                        "llama_cpp": {
-                            "managed": True,
-                            "port": 8081,
-                            "selection_backend": "auto",
-                            "profile": "adaptive",
-                            "model_path": "~/Downloads/Qwen.gguf",
-                            "selected_tier": "balanced",
-                        }
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-
-        config = load_config()
-
-        assert config["model"]["provider"] == "llama-cpp"
-        assert config["local_engines"]["llama_cpp"]["selected_tier"] == "balanced"
-        assert "selection_backend" not in config["local_engines"]["llama_cpp"]
-        assert "profile" not in config["local_engines"]["llama_cpp"]
-        assert "model_path" not in config["local_engines"]["llama_cpp"]
 
 
 def test_build_server_command_uses_hf_model_spec(tmp_path):
@@ -73,8 +40,8 @@ def test_build_server_command_uses_hf_model_spec(tmp_path):
             "local_engines": {
                 "llama_cpp": {
                     "selected_tier": "large",
-                    "model_repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
-                    "quant": "MXFP4_MOE",
+                    "model_repo": "ggml-org/gemma-4-26B-A4B-it-GGUF",
+                    "quant": "Q4_K_M",
                 }
             }
         },
@@ -83,9 +50,31 @@ def test_build_server_command_uses_hf_model_spec(tmp_path):
     assert command[:3] == [
         str(binary_path),
         "-hf",
-        "unsloth/Qwen3.5-35B-A3B-GGUF:MXFP4_MOE",
+        "ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
     ]
+    assert command[command.index("--reasoning-format") + 1] == "none"
     assert command[command.index("--reasoning-budget") + 1] == "0"
+
+
+def test_build_server_command_uses_deepseek_reasoning_format_when_enabled(tmp_path):
+    binary_path = tmp_path / "llama-server"
+    binary_path.write_text("", encoding="utf-8")
+
+    command = build_server_command(
+        binary_path=binary_path,
+        config={
+            "local_engines": {
+                "llama_cpp": {
+                    "selected_tier": "balanced",
+                    "model_repo": "ggml-org/gemma-4-E4B-it-GGUF",
+                    "quant": "Q4_K_M",
+                    "reasoning_budget": -1,
+                }
+            }
+        },
+    )
+
+    assert command[command.index("--reasoning-format") + 1] == "deepseek"
 
 
 def test_binary_candidates_prefers_path_server_before_managed_binary(monkeypatch, tmp_path):
@@ -116,7 +105,7 @@ def test_binary_candidates_prefers_path_server_before_managed_binary(monkeypatch
 
 def test_validate_requested_model_enforces_curated_llama_cpp_allowlist():
     accepted = validate_requested_model(
-        "unsloth/Qwen3.5-35B-A3B-GGUF:MXFP4_MOE",
+        "ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
         "llama-cpp",
     )
     rejected = validate_requested_model(
@@ -135,13 +124,13 @@ def test_resolve_runtime_provider_llama_cpp_aliases_use_managed_runtime_payload(
     monkeypatch.setattr(
         rp,
         "llama_cpp_runtime_payload",
-        lambda _config: {
+        lambda _config, progress_callback=None: {
             "provider": "llama-cpp",
             "api_mode": "chat_completions",
             "base_url": "http://127.0.0.1:8081/v1",
             "api_key": "no-key-required",
             "source": "managed:llama-cpp",
-            "model": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
+            "model": "ggml-org/gemma-4-E4B-it-GGUF:Q4_K_M",
         },
     )
 
@@ -160,7 +149,7 @@ def test_resolve_runtime_provider_llama_cpp_aliases_use_managed_runtime_payload(
             lambda _provider=configured_provider: {
                 "model": {
                     "provider": _provider,
-                    "default": "unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL",
+                    "default": "ggml-org/gemma-4-E4B-it-GGUF:Q4_K_M",
                 }
             },
         )

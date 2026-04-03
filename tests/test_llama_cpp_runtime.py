@@ -63,7 +63,7 @@ def test_build_api_kwargs_passes_llama_cpp_parallel_flag(agent):
 
 def test_llama_cpp_tool_turn_uses_parser_fallback_and_generated_ids(agent):
     agent.provider = "llama-cpp"
-    agent._llama_cpp_parser_chain = ["qwen3_coder"]
+    agent._llama_cpp_parser_chain = ["llama3_json"]
     agent._llama_cpp_streaming_tool_calls = True
     agent.stream_delta_callback = lambda _delta: None
 

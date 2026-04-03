@@ -49,30 +49,30 @@ LLAMA_CPP_RELEASE_REPO = "ggml-org/llama.cpp"
 LLAMA_CPP_STATE_VERSION = 1
 _DEFAULT_CONTEXT_LENGTH = 32768
 _SMOKE_TIMEOUT_SECONDS = 45.0
-_DEFAULT_PARSER_CHAIN = ["qwen3_coder", "qwen", "llama3_json", "hermes"]
+_DEFAULT_PARSER_CHAIN = ["llama3_json", "hermes"]
 _PROGRESS_POLL_INTERVAL_SECONDS = 1.0
 
 CURATED_MODELS: Dict[str, Dict[str, Any]] = {
     "tiny": {
         "tier": "tiny",
-        "model_repo": "unsloth/Qwen3.5-2B-GGUF",
-        "quant": "UD-Q4_K_XL",
+        "model_repo": "ggml-org/gemma-4-E2B-it-GGUF",
+        "quant": "Q8_0",
         "context_length": 32768,
         "template_strategy": "native",
         "parser_chain": list(_DEFAULT_PARSER_CHAIN),
     },
     "balanced": {
         "tier": "balanced",
-        "model_repo": "unsloth/Qwen3.5-9B-GGUF",
-        "quant": "UD-Q4_K_XL",
+        "model_repo": "ggml-org/gemma-4-E4B-it-GGUF",
+        "quant": "Q4_K_M",
         "context_length": 32768,
         "template_strategy": "native",
         "parser_chain": list(_DEFAULT_PARSER_CHAIN),
     },
     "large": {
         "tier": "large",
-        "model_repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
-        "quant": "UD-Q4_K_XL",
+        "model_repo": "ggml-org/gemma-4-26B-A4B-it-GGUF",
+        "quant": "Q4_K_M",
         "context_length": 32768,
         "template_strategy": "native",
         "parser_chain": list(_DEFAULT_PARSER_CHAIN),
@@ -106,7 +106,7 @@ def default_engine_config() -> Dict[str, Any]:
         "reasoning_budget": 0,
         "template_strategy": "native",
         "template_file": "",
-        "parallel_tool_calls": False,
+        "parallel_tool_calls": True,
         "streaming_tool_calls": True,
     }
 
@@ -409,6 +409,10 @@ def effective_reasoning_budget(config: Optional[Dict[str, Any]] = None) -> int:
         return int(cfg.get("reasoning_budget", 0))
     except Exception:
         return 0
+
+
+def effective_reasoning_format(config: Optional[Dict[str, Any]] = None) -> str:
+    return "none" if effective_reasoning_budget(config) == 0 else "deepseek"
 
 
 def binary_candidates() -> list[Path]:
@@ -809,6 +813,8 @@ def build_server_command(
             "--port",
             str(cfg["port"]),
             "--jinja",
+            "--reasoning-format",
+            effective_reasoning_format(config),
             "--reasoning-budget",
             str(effective_reasoning_budget(config)),
             "-c",

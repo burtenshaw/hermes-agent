@@ -1143,7 +1143,7 @@ def _model_flow_llama_cpp(config, current_model=""):
         pass
     elif action == "custom":
         try:
-            raw = input("Enter model spec (repo:quant, e.g. unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M): ").strip()
+            raw = input("Enter model spec (repo:quant, e.g. ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M): ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nNo change.")
             return
@@ -1191,7 +1191,7 @@ def _model_flow_llama_cpp(config, current_model=""):
         llama_cfg["parallel_tool_calls"] = True
     else:
         llama_cfg["parallel_tool_calls"] = False
-    llama_cfg["streaming_tool_calls"] = True
+    llama_cfg["streaming_tool_calls"] = False
 
     working = sync_config_model_fields(working, runtime)
     save_config(working)
