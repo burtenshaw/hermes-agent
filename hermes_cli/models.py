@@ -1160,7 +1160,9 @@ def validate_requested_model(
             "recognized": False,
             "message": (
                 f"`{requested}` is not in Hermes' curated llama.cpp allowlist. "
-                "Managed llama.cpp only supports vetted local models for reliable tool calling."
+                "Managed llama.cpp only supports vetted local models for reliable tool calling "
+                "through direct /model switching. Use `hermes model` -> `Local` -> "
+                "`Search Hugging Face GGUF` to try other llama.cpp-compatible repos."
                 f"{suggestion_text}"
             ),
         }

@@ -1041,8 +1041,20 @@ def select_provider_and_model(
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
-def _prompt_provider_choice(choices):
-    """Show provider selection menu. Returns index or None."""
+def _format_compact_number(value):
+    try:
+        num = int(value)
+    except Exception:
+        return str(value or "")
+    if num >= 1_000_000:
+        return f"{num / 1_000_000:.1f}M"
+    if num >= 1_000:
+        return f"{num / 1_000:.1f}k"
+    return str(num)
+
+
+def _prompt_provider_choice(choices, *, title="Select provider:"):
+    """Show a single-select menu. Returns index or None."""
     try:
         from simple_term_menu import TerminalMenu
         menu_items = [f"  {c}" for c in choices]
@@ -1051,7 +1063,7 @@ def _prompt_provider_choice(choices):
             menu_cursor="-> ", menu_cursor_style=("fg_green", "bold"),
             menu_highlight_style=("fg_green",),
             cycle_cursor=True, clear_screen=False,
-            title="Select provider:",
+            title=title,
         )
         idx = menu.show()
         print()
@@ -1060,7 +1072,7 @@ def _prompt_provider_choice(choices):
         pass
 
     # Fallback: numbered list
-    print("Select provider:")
+    print(title)
     for i, c in enumerate(choices, 1):
         print(f"  {i}. {c}")
     print()
@@ -1093,6 +1105,9 @@ def _model_flow_llama_cpp(config, current_model=""):
         curated_entry_for_tier,
         ensure_runtime_ready,
         get_status,
+        list_huggingface_gguf_quants,
+        search_huggingface_models,
+        preferred_quant,
         spec_string,
         sync_config_model_fields,
     )
@@ -1120,6 +1135,9 @@ def _model_flow_llama_cpp(config, current_model=""):
         options.append(label)
         option_keys.append(("tier", tier))
 
+    options.append("Search Hugging Face GGUF (llama.cpp)")
+    option_keys.append(("search", ""))
+
     options.append("Custom HuggingFace GGUF (enter repo:quant)")
     option_keys.append(("custom", ""))
 
@@ -1141,6 +1159,104 @@ def _model_flow_llama_cpp(config, current_model=""):
     if action == "current":
         # Keep whatever is in the config — don't override with a curated tier.
         pass
+    elif action == "search":
+        try:
+            query = input("Search query [blank = trending]: ").strip()
+            pipeline_tag = input("Pipeline tag [image-text-to-text, 'any' to disable]: ").strip() or "image-text-to-text"
+            num_parameters = input("Parameter filter [min:0,max:32B, 'any' to disable]: ").strip() or "min:0,max:32B"
+        except (EOFError, KeyboardInterrupt):
+            print("\nNo change.")
+            return
+
+        if pipeline_tag.lower() in {"any", "none", "*"}:
+            pipeline_tag = ""
+        if num_parameters.lower() in {"any", "none", "*"}:
+            num_parameters = ""
+
+        print()
+        print("Searching Hugging Face...")
+        try:
+            results = search_huggingface_models(
+                query=query,
+                pipeline_tag=pipeline_tag,
+                num_parameters=num_parameters,
+            )
+        except Exception as exc:
+            print(f"Hugging Face search failed: {exc}")
+            return
+        if not results:
+            print("No matching llama.cpp repos found.")
+            return
+
+        search_labels = []
+        for item in results:
+            meta = []
+            if item.get("pipeline_tag"):
+                meta.append(str(item["pipeline_tag"]))
+            if item.get("downloads"):
+                meta.append(f"{_format_compact_number(item['downloads'])} downloads")
+            if item.get("likes"):
+                meta.append(f"{_format_compact_number(item['likes'])} likes")
+            label = str(item["id"])
+            if meta:
+                label += " — " + " • ".join(meta)
+            search_labels.append(label)
+        search_labels.append("Cancel")
+
+        selected_idx = _prompt_provider_choice(search_labels, title="Select Hugging Face model:")
+        if selected_idx is None or selected_idx >= len(results):
+            print("No change.")
+            return
+
+        selected_repo = results[selected_idx]["id"]
+        print()
+        print(f"Fetching GGUF quants for {selected_repo}...")
+        try:
+            quants = list_huggingface_gguf_quants(selected_repo)
+        except Exception as exc:
+            print(f"Could not inspect GGUF files: {exc}")
+            return
+
+        quant = ""
+        if not quants:
+            try:
+                quant = input("Could not infer quants automatically. Enter quant manually: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nNo change.")
+                return
+            if not quant:
+                print("No change.")
+                return
+        elif len(quants) == 1:
+            quant = quants[0]
+            print(f"Using only available quant: {quant}")
+        else:
+            quant_labels = []
+            preferred = preferred_quant(quants)
+            for value in quants:
+                label = value
+                if value == preferred:
+                    label += "  ← default"
+                quant_labels.append(label)
+            quant_labels.append("Cancel")
+            quant_idx = _prompt_provider_choice(quant_labels, title="Select GGUF quant:")
+            if quant_idx is None or quant_idx >= len(quants):
+                print("No change.")
+                return
+            quant = quants[quant_idx]
+
+        local_engines = working.setdefault("local_engines", {})
+        if not isinstance(local_engines, dict):
+            local_engines = {}
+            working["local_engines"] = local_engines
+        llama_cfg = local_engines.setdefault("llama_cpp", {})
+        if not isinstance(llama_cfg, dict):
+            llama_cfg = {}
+            local_engines["llama_cpp"] = llama_cfg
+        llama_cfg["model_repo"] = selected_repo
+        llama_cfg["quant"] = quant
+        llama_cfg["selected_tier"] = ""
+        llama_cfg["context_length"] = 0
     elif action == "custom":
         try:
             raw = input("Enter model spec (repo:quant, e.g. ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M): ").strip()
@@ -1166,6 +1282,7 @@ def _model_flow_llama_cpp(config, current_model=""):
         llama_cfg["model_repo"] = parsed["model_repo"]
         llama_cfg["quant"] = parsed.get("quant", "")
         llama_cfg["selected_tier"] = ""
+        llama_cfg["context_length"] = 0
     else:
         working = configure_selected_model(working, tier=tier)
 
