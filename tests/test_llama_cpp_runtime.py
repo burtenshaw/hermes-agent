@@ -64,7 +64,7 @@ def test_build_api_kwargs_passes_llama_cpp_parallel_flag(agent):
 def test_llama_cpp_tool_turn_uses_parser_fallback_and_generated_ids(agent):
     agent.provider = "llama-cpp"
     agent._llama_cpp_parser_chain = ["qwen3_coder"]
-    agent._llama_cpp_streaming_tool_calls = False
+    agent._llama_cpp_streaming_tool_calls = True
     agent.stream_delta_callback = lambda _delta: None
 
     resp1 = _mock_response(
@@ -87,8 +87,8 @@ def test_llama_cpp_tool_turn_uses_parser_fallback_and_generated_ids(agent):
 
     with (
         patch("environments.tool_call_parsers.get_parser", return_value=parser),
-        patch.object(agent, "_interruptible_api_call", side_effect=[resp1, resp2]) as mock_nonstream,
-        patch.object(agent, "_interruptible_streaming_api_call") as mock_stream,
+        patch.object(agent, "_interruptible_api_call") as mock_nonstream,
+        patch.object(agent, "_interruptible_streaming_api_call", side_effect=[resp1, resp2]) as mock_stream,
         patch("run_agent.handle_function_call", return_value="search result"),
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
@@ -97,8 +97,8 @@ def test_llama_cpp_tool_turn_uses_parser_fallback_and_generated_ids(agent):
         result = agent.run_conversation("search something")
 
     assert result["final_response"] == "Done searching"
-    assert mock_nonstream.call_count == 2
-    mock_stream.assert_not_called()
+    assert mock_stream.call_count == 2
+    mock_nonstream.assert_not_called()
 
     assistant_tool_turns = [
         message

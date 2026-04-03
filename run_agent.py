@@ -45,7 +45,7 @@ import fire
 from datetime import datetime
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import VALID_REASONING_EFFORTS, get_hermes_home
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
@@ -94,6 +94,7 @@ from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
     get_cute_tool_message as _get_cute_tool_message_impl,
+    get_provider_thinking_verbs,
     _detect_tool_failure,
     get_tool_emoji as _get_tool_emoji,
 )
@@ -4939,6 +4940,49 @@ class AIAgent:
     def _is_llama_cpp_provider(self) -> bool:
         return (getattr(self, "provider", "") or "").lower() == "llama-cpp"
 
+    def _llama_cpp_reasoning_effort(self) -> str:
+        """Return the effective reasoning effort for llama.cpp sessions.
+
+        llama.cpp does not expose the same structured reasoning API as
+        OpenRouter/OpenAI. Hermes still uses the familiar reasoning-effort
+        setting to steer local models, defaulting to ``low`` when no explicit
+        effort is configured.
+        """
+        if not self._is_llama_cpp_provider():
+            return ""
+        rc = self.reasoning_config
+        if isinstance(rc, dict):
+            if rc.get("enabled") is False:
+                return "none"
+            effort = str(rc.get("effort") or "").strip().lower()
+            if effort in VALID_REASONING_EFFORTS:
+                return effort
+        return "low"
+
+    def _llama_cpp_reasoning_hint(self) -> str:
+        """Return a short API-call-time hint for llama.cpp reasoning depth."""
+        effort = self._llama_cpp_reasoning_effort()
+        if not effort:
+            return ""
+        if effort in {"none", "minimal"}:
+            return (
+                "For this session, keep hidden reasoning disabled. "
+                "Respond directly unless a tool call is required."
+            )
+        if effort == "low":
+            return (
+                "For this session, keep hidden reasoning brief. "
+                "Use the minimum internal thinking needed to answer correctly "
+                "or choose the next tool."
+            )
+        if effort == "medium":
+            return "For this session, use moderate hidden reasoning."
+        if effort == "high":
+            return "For this session, use thorough hidden reasoning when needed, but stay concise."
+        if effort == "xhigh":
+            return "For this session, use very thorough hidden reasoning when needed."
+        return ""
+
     def _ensure_tool_call_ids(self, tool_calls: list) -> list:
         """Assign deterministic ids to tool calls that arrive without one."""
         normalized = []
@@ -6827,6 +6871,9 @@ class AIAgent:
             effective_system = active_system_prompt or ""
             if self.ephemeral_system_prompt:
                 effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            llama_cpp_reasoning_hint = self._llama_cpp_reasoning_hint()
+            if llama_cpp_reasoning_hint:
+                effective_system = (effective_system + "\n\n" + llama_cpp_reasoning_hint).strip()
             # Plugin context from pre_llm_call hooks — ephemeral, not cached.
             if _plugin_turn_context:
                 effective_system = (effective_system + "\n\n" + _plugin_turn_context).strip()
@@ -6867,7 +6914,8 @@ class AIAgent:
             else:
                 # Animated thinking spinner in quiet mode
                 face = random.choice(KawaiiSpinner.KAWAII_THINKING)
-                verb = random.choice(KawaiiSpinner.THINKING_VERBS)
+                verb_choices = get_provider_thinking_verbs(self.provider)
+                verb = random.choice(verb_choices or KawaiiSpinner.THINKING_VERBS)
                 if self.thinking_callback:
                     # CLI TUI mode: use prompt_toolkit widget instead of raw spinner
                     # (works in both streaming and non-streaming modes)
@@ -6935,13 +6983,6 @@ class AIAgent:
                         from unittest.mock import Mock
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
-                    if (
-                        _use_streaming
-                        and self._is_llama_cpp_provider()
-                        and self.tools
-                        and not self._llama_cpp_streaming_tool_calls
-                    ):
-                        _use_streaming = False
 
                     if _use_streaming:
                         response = self._interruptible_streaming_api_call(

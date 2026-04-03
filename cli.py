@@ -1360,6 +1360,16 @@ class HermesCLI:
             self._last_invalidate = now
             self._app.invalidate()
 
+    def _set_runtime_progress(self, text: str) -> None:
+        """Expose local-runtime startup progress in the existing TUI widgets."""
+        status = str(text or "").strip()
+        if not status:
+            return
+        self._command_running = True
+        self._command_status = status
+        self._spinner_text = status
+        self._invalidate(min_interval=0.0)
+
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
             return "class:status-bar-dim"
@@ -2007,19 +2017,43 @@ class HermesCLI:
         Returns True if credentials are ready, False on auth failure.
         """
         from hermes_cli.runtime_provider import (
+            resolve_requested_provider,
             resolve_runtime_provider,
             format_runtime_provider_error,
         )
+        from hermes_cli.llama_cpp import is_llama_cpp_provider
 
+        show_llama_progress = False
+        previous_progress_state = (
+            self._command_running,
+            self._command_status,
+            self._spinner_text,
+        )
+        error_message = ""
         try:
+            requested_provider = resolve_requested_provider(self.requested_provider)
+            show_llama_progress = is_llama_cpp_provider(requested_provider)
+            if show_llama_progress:
+                self._set_runtime_progress("Checking local llama.cpp runtime...")
             runtime = resolve_runtime_provider(
                 requested=self.requested_provider,
                 explicit_api_key=self._explicit_api_key,
                 explicit_base_url=self._explicit_base_url,
+                progress_callback=self._set_runtime_progress if show_llama_progress else None,
             )
         except Exception as exc:
-            message = format_runtime_provider_error(exc)
-            self.console.print(f"[bold red]{message}[/]")
+            error_message = format_runtime_provider_error(exc)
+        finally:
+            if show_llama_progress:
+                (
+                    self._command_running,
+                    self._command_status,
+                    self._spinner_text,
+                ) = previous_progress_state
+                self._invalidate(min_interval=0.0)
+
+        if error_message:
+            _cprint(f"\033[1;31m{error_message}{_RST}")
             return False
 
         api_key = runtime.get("api_key")
