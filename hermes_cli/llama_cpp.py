@@ -32,7 +32,7 @@ import urllib.request
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Callable, Dict, Iterable, Optional
 
 import requests
 
@@ -50,6 +50,7 @@ LLAMA_CPP_STATE_VERSION = 1
 _DEFAULT_CONTEXT_LENGTH = 32768
 _SMOKE_TIMEOUT_SECONDS = 45.0
 _DEFAULT_PARSER_CHAIN = ["qwen3_coder", "qwen", "llama3_json", "hermes"]
+_PROGRESS_POLL_INTERVAL_SECONDS = 1.0
 
 CURATED_MODELS: Dict[str, Dict[str, Any]] = {
     "tiny": {
@@ -71,7 +72,7 @@ CURATED_MODELS: Dict[str, Dict[str, Any]] = {
     "large": {
         "tier": "large",
         "model_repo": "unsloth/Qwen3.5-35B-A3B-GGUF",
-        "quant": "MXFP4_MOE",
+        "quant": "UD-Q4_K_XL",
         "context_length": 32768,
         "template_strategy": "native",
         "parser_chain": list(_DEFAULT_PARSER_CHAIN),
@@ -90,6 +91,9 @@ class LlamaCppError(RuntimeError):
     """User-facing managed-runtime error."""
 
 
+ProgressCallback = Optional[Callable[[str], None]]
+
+
 def default_engine_config() -> Dict[str, Any]:
     return {
         "managed": True,
@@ -103,7 +107,7 @@ def default_engine_config() -> Dict[str, Any]:
         "template_strategy": "native",
         "template_file": "",
         "parallel_tool_calls": False,
-        "streaming_tool_calls": False,
+        "streaming_tool_calls": True,
     }
 
 
@@ -143,6 +147,17 @@ def _utc_now_iso() -> str:
 def _mkdirs() -> None:
     get_engine_bin_dir().mkdir(parents=True, exist_ok=True)
     get_engine_logs_dir().mkdir(parents=True, exist_ok=True)
+
+
+def get_llama_cpp_cache_dir() -> Path:
+    if platform.system() == "Darwin":
+        return Path.home() / "Library" / "Caches" / "llama.cpp"
+    if _WINDOWS:
+        local_appdata = os.getenv("LOCALAPPDATA", "").strip()
+        if local_appdata:
+            return Path(local_appdata) / "llama.cpp"
+        return Path.home() / "AppData" / "Local" / "llama.cpp"
+    return Path.home() / ".cache" / "llama.cpp"
 
 
 def load_state() -> Dict[str, Any]:
@@ -241,6 +256,131 @@ def curated_model_specs() -> list[str]:
     return list(_CURATED_SPECS.keys())
 
 
+def _emit_progress(progress_callback: ProgressCallback, message: str) -> None:
+    if not progress_callback:
+        return
+    text = str(message or "").strip()
+    if not text:
+        return
+    try:
+        progress_callback(text)
+    except Exception:
+        logger.debug("llama.cpp progress callback failed", exc_info=True)
+
+
+def _format_bytes(num_bytes: int) -> str:
+    size = float(max(0, int(num_bytes or 0)))
+    units = ("B", "KB", "MB", "GB", "TB")
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            if size >= 100:
+                return f"{size:.0f} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024.0
+    return "0 B"
+
+
+def _cache_repo_fragment(model_repo: str, separator: str) -> str:
+    return str(model_repo or "").strip().replace("/", separator)
+
+
+def _cache_manifest_path(model_repo: str, quant: str) -> Path:
+    cache_dir = get_llama_cpp_cache_dir()
+    return cache_dir / f"manifest={_cache_repo_fragment(model_repo, '=')}={quant}.json"
+
+
+def _cache_artifact_paths(model_repo: str, filename: str) -> tuple[Path, Path]:
+    cache_dir = get_llama_cpp_cache_dir()
+    prefix = _cache_repo_fragment(model_repo, "_")
+    final_path = cache_dir / f"{prefix}_{filename}"
+    partial_path = Path(str(final_path) + ".downloadInProgress")
+    return final_path, partial_path
+
+
+def _read_cache_manifest(entry: Dict[str, Any]) -> Dict[str, Any]:
+    manifest_path = _cache_manifest_path(entry.get("model_repo", ""), entry.get("quant", ""))
+    if not manifest_path.exists():
+        return {}
+    try:
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def describe_startup_progress(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = get_engine_config(config)
+    entry = selected_model_entry(cfg)
+    manifest = _read_cache_manifest(entry)
+    if not manifest:
+        return {}
+
+    artifacts = (
+        ("ggufFile", "model"),
+        ("mmprojFile", "projector"),
+    )
+    for key, label in artifacts:
+        artifact = manifest.get(key)
+        if not isinstance(artifact, dict):
+            continue
+        filename = str(artifact.get("rfilename") or "").strip()
+        total_bytes = artifact.get("size")
+        if not isinstance(total_bytes, int) or total_bytes <= 0:
+            lfs = artifact.get("lfs")
+            if isinstance(lfs, dict):
+                total_bytes = lfs.get("size")
+        try:
+            total_bytes = int(total_bytes or 0)
+        except Exception:
+            total_bytes = 0
+        if not filename or total_bytes <= 0:
+            continue
+
+        final_path, partial_path = _cache_artifact_paths(entry["model_repo"], filename)
+        if partial_path.exists():
+            current_bytes = partial_path.stat().st_size
+            percent = max(0, min(100, round((current_bytes / total_bytes) * 100)))
+            return {
+                "phase": "downloading",
+                "artifact": label,
+                "current_bytes": current_bytes,
+                "total_bytes": total_bytes,
+                "message": (
+                    f"Downloading {label} {_format_bytes(current_bytes)} / "
+                    f"{_format_bytes(total_bytes)} ({percent}%)"
+                ),
+            }
+
+        if final_path.exists():
+            current_bytes = final_path.stat().st_size
+            if current_bytes < total_bytes:
+                percent = max(0, min(100, round((current_bytes / total_bytes) * 100)))
+                return {
+                    "phase": "downloading",
+                    "artifact": label,
+                    "current_bytes": current_bytes,
+                    "total_bytes": total_bytes,
+                    "message": (
+                        f"Downloading {label} {_format_bytes(current_bytes)} / "
+                        f"{_format_bytes(total_bytes)} ({percent}%)"
+                    ),
+                }
+            continue
+
+        return {
+            "phase": "preparing",
+            "artifact": label,
+            "message": f"Preparing {label} download...",
+        }
+
+    return {
+        "phase": "loading",
+        "message": "Loading model into memory...",
+    }
+
+
 def curated_entry_for_tier(tier: str) -> Dict[str, Any]:
     normalized = str(tier or "").strip().lower()
     if normalized not in CURATED_MODELS:
@@ -261,6 +401,14 @@ def recommended_parser_chain(config: Optional[Dict[str, Any]] = None) -> list[st
     if tier not in CURATED_MODELS:
         tier = "balanced"
     return list(curated_entry_for_tier(tier).get("parser_chain") or _DEFAULT_PARSER_CHAIN)
+
+
+def effective_reasoning_budget(config: Optional[Dict[str, Any]] = None) -> int:
+    cfg = get_engine_config(config)
+    try:
+        return int(cfg.get("reasoning_budget", 0))
+    except Exception:
+        return 0
 
 
 def binary_candidates() -> list[Path]:
@@ -584,13 +732,59 @@ def _terminate_existing_process(state: Dict[str, Any]) -> None:
             pass
 
 
+def _kill_server_on_port(port: int) -> None:
+    """Find and kill any llama-server process listening on *port*."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-ti", f"tcp:{port}"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        return
+    for pid_str in out.splitlines():
+        try:
+            pid = int(pid_str.strip())
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            continue
+    # Wait briefly for the port to free up.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            out = subprocess.check_output(
+                ["lsof", "-ti", f"tcp:{port}"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            ).strip()
+            if not out:
+                return
+        except Exception:
+            return
+        time.sleep(0.5)
+
+
 def selected_model_entry(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cfg = get_engine_config(config)
-    current = curated_entry_for_spec(cfg.get("model_repo", ""), cfg.get("quant", ""))
+    model_repo = cfg.get("model_repo", "").strip()
+    quant = cfg.get("quant", "").strip()
+    # Check curated list first.
+    current = curated_entry_for_spec(model_repo, quant)
     if current is not None:
         merged = dict(current)
         merged["context_length"] = cfg.get("context_length") or current.get("context_length") or _DEFAULT_CONTEXT_LENGTH
         return merged
+    # Explicit repo+quant not in the curated list — use as-is (custom model).
+    if model_repo:
+        return {
+            "tier": cfg.get("selected_tier") or "",
+            "model_repo": model_repo,
+            "quant": quant,
+            "context_length": cfg.get("context_length") or _DEFAULT_CONTEXT_LENGTH,
+            "template_strategy": cfg.get("template_strategy", "native"),
+            "parser_chain": list(_DEFAULT_PARSER_CHAIN),
+        }
+    # Nothing configured — fall back to a curated tier.
     tier = cfg.get("selected_tier") or "balanced"
     if tier not in CURATED_MODELS:
         tier = "balanced"
@@ -616,7 +810,7 @@ def build_server_command(
             str(cfg["port"]),
             "--jinja",
             "--reasoning-budget",
-            str(cfg.get("reasoning_budget", 0)),
+            str(effective_reasoning_budget(config)),
             "-c",
             str(entry.get("context_length") or _DEFAULT_CONTEXT_LENGTH),
         ]
@@ -628,21 +822,49 @@ def build_server_command(
     return command
 
 
-def start_server(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def start_server(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
     cfg = get_engine_config(config)
     state = load_state()
     base_url = runtime_base_url(cfg)
+    entry = selected_model_entry(cfg)
+    model_spec = spec_string(entry["model_repo"], entry["quant"])
+    last_progress_message = ""
+
+    def report(message: str) -> None:
+        nonlocal last_progress_message
+        text = str(message or "").strip()
+        if not text or text == last_progress_message:
+            return
+        last_progress_message = text
+        _emit_progress(progress_callback, text)
+
+    report(f"Checking local model {model_spec}...")
     probe = _probe_server(base_url)
     if probe["healthy"]:
-        state["actual_model_id"] = probe.get("actual_model_id") or state.get("actual_model_id")
-        state["last_health_check"] = _utc_now_iso()
-        save_state(state)
-        return get_status(cfg)
+        # Verify the running server has the correct model loaded.
+        # A stale server from a previous config may still be listening
+        # on the same port with a different (possibly broken) model.
+        running_model = probe.get("actual_model_id") or ""
+        if running_model == model_spec:
+            state["actual_model_id"] = running_model
+            state["last_health_check"] = _utc_now_iso()
+            save_state(state)
+            return get_status(cfg)
+        report(f"Wrong model loaded ({running_model}), restarting...")
+        # Kill whatever is on the port — may be a manually started server
+        # or one from a previous config whose PID we no longer track.
+        _kill_server_on_port(cfg["port"])
 
     if state.get("pid") and _pid_is_alive(state.get("pid")):
         _terminate_existing_process(state)
 
+    report("Ensuring llama.cpp binary is ready...")
     binary_path = ensure_binary_installed(cfg)
+    report("Launching llama-server...")
     command = build_server_command(binary_path=binary_path, config=cfg)
     log_path = get_engine_logs_dir() / f"llama-server-{int(time.time())}.log"
     _mkdirs()
@@ -662,10 +884,7 @@ def start_server(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             "log_path": str(log_path),
             "base_url": base_url,
             "started_at": _utc_now_iso(),
-            "desired_model_spec": spec_string(
-                selected_model_entry(cfg)["model_repo"],
-                selected_model_entry(cfg)["quant"],
-            ),
+            "desired_model_spec": model_spec,
         }
     )
     save_state(state)
@@ -673,8 +892,10 @@ def start_server(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     deadline = time.time() + 180
     while time.time() < deadline:
         if process.poll() is not None:
+            detail = f" Last step: {last_progress_message}." if last_progress_message else ""
             raise LlamaCppError(
-                f"Managed llama.cpp server exited early. Check {display_hermes_home()}/local_engines/llama_cpp/logs for details."
+                "Managed llama.cpp server exited early."
+                f"{detail} Check {display_hermes_home()}/local_engines/llama_cpp/logs for details."
             )
         probe = _probe_server(base_url)
         if probe["healthy"]:
@@ -683,11 +904,15 @@ def start_server(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
             state["props"] = probe.get("props")
             save_state(state)
             return get_status(cfg)
-        time.sleep(1.0)
+        progress = describe_startup_progress(cfg)
+        if progress.get("message"):
+            report(str(progress["message"]))
+        time.sleep(_PROGRESS_POLL_INTERVAL_SECONDS)
 
+    detail = f" Last step: {last_progress_message}." if last_progress_message else ""
     raise LlamaCppError(
         f"Timed out waiting for llama.cpp to become healthy at {base_url}. "
-        f"Check {display_hermes_home()}/local_engines/llama_cpp/logs."
+        f"{detail} Check {display_hermes_home()}/local_engines/llama_cpp/logs."
     )
 
 
@@ -980,7 +1205,7 @@ def get_status(config: Optional[Dict[str, Any]] = None, *, check_health: bool = 
         "model_spec": spec_string(entry["model_repo"], entry["quant"]),
         "selected_tier": entry.get("tier") or cfg.get("selected_tier") or "",
         "context_length": int(entry.get("context_length") or cfg.get("context_length") or _DEFAULT_CONTEXT_LENGTH),
-        "reasoning_budget": int(cfg.get("reasoning_budget", 0)),
+        "reasoning_budget": effective_reasoning_budget(config),
         "template_strategy": cfg.get("template_strategy", "native"),
         "template_file": cfg.get("template_file") or "",
         "parallel_tool_calls": bool(cfg.get("parallel_tool_calls", False)),
@@ -1006,8 +1231,13 @@ def get_status(config: Optional[Dict[str, Any]] = None, *, check_health: bool = 
     return status
 
 
-def ensure_runtime_ready(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def ensure_runtime_ready(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
     cfg = get_engine_config(config)
+    _emit_progress(progress_callback, "Checking local llama.cpp runtime...")
     if not cfg.get("auto_start", True):
         status = get_status(cfg)
         if not status.get("healthy"):
@@ -1017,11 +1247,17 @@ def ensure_runtime_ready(config: Optional[Dict[str, Any]] = None) -> Dict[str, A
         return status
 
     status = get_status(cfg)
-    if not status.get("healthy"):
-        status = start_server(cfg)
+    desired_spec = spec_string(
+        selected_model_entry(cfg)["model_repo"],
+        selected_model_entry(cfg)["quant"],
+    )
+    running_model = status.get("actual_model_id") or ""
+    if not status.get("healthy") or running_model != desired_spec:
+        status = start_server(cfg, progress_callback=progress_callback)
 
     smoke = status.get("smoke_tests") if isinstance(status.get("smoke_tests"), dict) else {}
     if not smoke.get("passed"):
+        _emit_progress(progress_callback, "Running llama.cpp smoke tests...")
         smoke = run_smoke_tests(cfg)
         status = get_status(cfg)
         status["smoke_tests"] = smoke
@@ -1037,8 +1273,12 @@ def ensure_runtime_ready(config: Optional[Dict[str, Any]] = None) -> Dict[str, A
     return status
 
 
-def runtime_payload(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    status = ensure_runtime_ready(config)
+def runtime_payload(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
+    status = ensure_runtime_ready(config, progress_callback=progress_callback)
     actual_model = status.get("actual_model_id") or status.get("model_spec")
     return {
         "provider": LLAMA_CPP_PROVIDER,
@@ -1093,7 +1333,13 @@ def configure_selected_model(
     engine_cfg["model_repo"] = model_repo or curated["model_repo"]
     engine_cfg["quant"] = quant or curated["quant"]
     engine_cfg["context_length"] = int(context_length or curated.get("context_length") or _DEFAULT_CONTEXT_LENGTH)
-    engine_cfg["reasoning_budget"] = int(engine_cfg.get("reasoning_budget", 0))
+    if "reasoning_budget" in engine_cfg:
+        try:
+            engine_cfg["reasoning_budget"] = int(engine_cfg.get("reasoning_budget"))
+        except Exception:
+            engine_cfg["reasoning_budget"] = 0
+    else:
+        engine_cfg["reasoning_budget"] = 0
     engine_cfg["template_strategy"] = curated.get("template_strategy", "native")
     return config
 

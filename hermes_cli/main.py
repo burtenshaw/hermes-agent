@@ -1110,7 +1110,7 @@ def _model_flow_llama_cpp(config, current_model=""):
     option_keys = []
     if current_spec:
         options.append(f"Keep current ({current_spec})")
-        option_keys.append(("current", current_status.get("selected_tier") or "balanced"))
+        option_keys.append(("current", ""))
 
     for tier in ("tiny", "balanced", "large"):
         entry = curated_entry_for_tier(tier)
@@ -1119,6 +1119,9 @@ def _model_flow_llama_cpp(config, current_model=""):
             label += "  ← default"
         options.append(label)
         option_keys.append(("tier", tier))
+
+    options.append("Custom HuggingFace GGUF (enter repo:quant)")
+    option_keys.append(("custom", ""))
 
     options.append("Cancel")
     option_keys.append(("cancel", ""))
@@ -1133,12 +1136,38 @@ def _model_flow_llama_cpp(config, current_model=""):
         print("No change.")
         return
 
-    selected_tier = tier
-    if action == "current" and current_status.get("selected_tier"):
-        selected_tier = str(current_status["selected_tier"])
-
     working = load_config()
-    working = configure_selected_model(working, tier=selected_tier)
+
+    if action == "current":
+        # Keep whatever is in the config — don't override with a curated tier.
+        pass
+    elif action == "custom":
+        try:
+            raw = input("Enter model spec (repo:quant, e.g. unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nNo change.")
+            return
+        if not raw:
+            print("No change.")
+            return
+        from hermes_cli.llama_cpp import parse_model_spec
+        parsed = parse_model_spec(raw)
+        if not parsed.get("model_repo"):
+            print("Invalid model spec.")
+            return
+        local_engines = working.setdefault("local_engines", {})
+        if not isinstance(local_engines, dict):
+            local_engines = {}
+            working["local_engines"] = local_engines
+        llama_cfg = local_engines.setdefault("llama_cpp", {})
+        if not isinstance(llama_cfg, dict):
+            llama_cfg = {}
+            local_engines["llama_cpp"] = llama_cfg
+        llama_cfg["model_repo"] = parsed["model_repo"]
+        llama_cfg["quant"] = parsed.get("quant", "")
+        llama_cfg["selected_tier"] = ""
+    else:
+        working = configure_selected_model(working, tier=tier)
 
     local_engines = working.setdefault("local_engines", {})
     if not isinstance(local_engines, dict):
@@ -1162,7 +1191,7 @@ def _model_flow_llama_cpp(config, current_model=""):
         llama_cfg["parallel_tool_calls"] = True
     else:
         llama_cfg["parallel_tool_calls"] = False
-    llama_cfg["streaming_tool_calls"] = False
+    llama_cfg["streaming_tool_calls"] = True
 
     working = sync_config_model_fields(working, runtime)
     save_config(working)

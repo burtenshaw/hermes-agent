@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from hermes_cli import auth as auth_mod
 from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
@@ -530,12 +530,13 @@ def resolve_runtime_provider(
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution."""
     requested_provider = resolve_requested_provider(requested)
 
     if is_llama_cpp_provider(requested_provider):
-        runtime = llama_cpp_runtime_payload(load_config())
+        runtime = llama_cpp_runtime_payload(load_config(), progress_callback=progress_callback)
         runtime["requested_provider"] = requested_provider
         return runtime
 

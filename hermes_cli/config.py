@@ -1518,6 +1518,8 @@ def _normalize_llama_cpp_config(config: Dict[str, Any]) -> Dict[str, Any]:
         llama_cfg = dict(llama_cfg)
         for obsolete_key in ("selection_backend", "profile", "model_path"):
             llama_cfg.pop(obsolete_key, None)
+        if llama_cfg.get("reasoning_budget") == -1:
+            llama_cfg["reasoning_budget"] = 0
         local_engines["llama_cpp"] = llama_cfg
     managed = bool(llama_cfg.get("managed", DEFAULT_CONFIG["local_engines"]["llama_cpp"]["managed"]))
     try:
