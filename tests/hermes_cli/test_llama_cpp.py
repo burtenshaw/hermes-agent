@@ -52,7 +52,8 @@ def test_build_server_command_uses_hf_model_spec(tmp_path):
         "-hf",
         "ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
     ]
-    assert command[command.index("--reasoning-format") + 1] == "none"
+    assert command[command.index("-c") + 1] == "262144"
+    assert command[command.index("--reasoning-format") + 1] == "deepseek"
     assert command[command.index("--reasoning-budget") + 1] == "0"
 
 
@@ -60,6 +61,8 @@ def test_build_server_command_uses_deepseek_reasoning_format_when_enabled(tmp_pa
     binary_path = tmp_path / "llama-server"
     binary_path.write_text("", encoding="utf-8")
 
+    # -1 (unlimited) is clamped to 0 (disabled) for safety, but format
+    # is always "deepseek" so llama-server can parse thinking/tool tokens
     command = build_server_command(
         binary_path=binary_path,
         config={
@@ -74,7 +77,27 @@ def test_build_server_command_uses_deepseek_reasoning_format_when_enabled(tmp_pa
         },
     )
 
+    assert command[command.index("-c") + 1] == "131072"
     assert command[command.index("--reasoning-format") + 1] == "deepseek"
+    assert command[command.index("--reasoning-budget") + 1] == "0"
+
+    # Positive budget also uses deepseek format
+    command = build_server_command(
+        binary_path=binary_path,
+        config={
+            "local_engines": {
+                "llama_cpp": {
+                    "selected_tier": "balanced",
+                    "model_repo": "ggml-org/gemma-4-E4B-it-GGUF",
+                    "quant": "Q4_K_M",
+                    "reasoning_budget": 1024,
+                }
+            }
+        },
+    )
+
+    assert command[command.index("--reasoning-format") + 1] == "deepseek"
+    assert command[command.index("--reasoning-budget") + 1] == "1024"
 
 
 def test_binary_candidates_prefers_path_server_before_managed_binary(monkeypatch, tmp_path):

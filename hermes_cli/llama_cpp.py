@@ -26,6 +26,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -51,13 +52,14 @@ _DEFAULT_CONTEXT_LENGTH = 32768
 _SMOKE_TIMEOUT_SECONDS = 45.0
 _DEFAULT_PARSER_CHAIN = ["llama3_json", "hermes"]
 _PROGRESS_POLL_INTERVAL_SECONDS = 1.0
+_server_start_lock = threading.Lock()
 
 CURATED_MODELS: Dict[str, Dict[str, Any]] = {
     "tiny": {
         "tier": "tiny",
         "model_repo": "ggml-org/gemma-4-E2B-it-GGUF",
         "quant": "Q8_0",
-        "context_length": 32768,
+        "context_length": 131072,
         "template_strategy": "native",
         "parser_chain": list(_DEFAULT_PARSER_CHAIN),
     },
@@ -65,7 +67,7 @@ CURATED_MODELS: Dict[str, Dict[str, Any]] = {
         "tier": "balanced",
         "model_repo": "ggml-org/gemma-4-E4B-it-GGUF",
         "quant": "Q4_K_M",
-        "context_length": 32768,
+        "context_length": 131072,
         "template_strategy": "native",
         "parser_chain": list(_DEFAULT_PARSER_CHAIN),
     },
@@ -73,7 +75,7 @@ CURATED_MODELS: Dict[str, Dict[str, Any]] = {
         "tier": "large",
         "model_repo": "ggml-org/gemma-4-26B-A4B-it-GGUF",
         "quant": "Q4_K_M",
-        "context_length": 32768,
+        "context_length": 262144,
         "template_strategy": "native",
         "parser_chain": list(_DEFAULT_PARSER_CHAIN),
     },
@@ -102,7 +104,7 @@ def default_engine_config() -> Dict[str, Any]:
         "selected_tier": "",
         "model_repo": "",
         "quant": "",
-        "context_length": _DEFAULT_CONTEXT_LENGTH,
+        "context_length": 0,
         "reasoning_budget": 0,
         "template_strategy": "native",
         "template_file": "",
@@ -211,10 +213,14 @@ def get_engine_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         merged["port"] = int(merged.get("port") or LLAMA_CPP_DEFAULT_PORT)
     except Exception:
         merged["port"] = LLAMA_CPP_DEFAULT_PORT
+    raw_context_length = merged.get("context_length")
     try:
-        merged["context_length"] = int(merged.get("context_length") or _DEFAULT_CONTEXT_LENGTH)
+        if raw_context_length in (None, ""):
+            merged["context_length"] = 0
+        else:
+            merged["context_length"] = max(0, int(raw_context_length))
     except Exception:
-        merged["context_length"] = _DEFAULT_CONTEXT_LENGTH
+        merged["context_length"] = 0
     try:
         merged["reasoning_budget"] = int(merged.get("reasoning_budget"))
     except Exception:
@@ -406,13 +412,19 @@ def recommended_parser_chain(config: Optional[Dict[str, Any]] = None) -> list[st
 def effective_reasoning_budget(config: Optional[Dict[str, Any]] = None) -> int:
     cfg = get_engine_config(config)
     try:
-        return int(cfg.get("reasoning_budget", 0))
+        # block unlimited reasoning budget
+        budget = int(cfg.get("reasoning_budget", 0))
+        return max(0, budget)
     except Exception:
         return 0
 
 
 def effective_reasoning_format(config: Optional[Dict[str, Any]] = None) -> str:
-    return "none" if effective_reasoning_budget(config) == 0 else "deepseek"
+    # Always use "deepseek" — with budget 0, thinking is suppressed but
+    # llama-server still correctly parses the model's native thinking/tool-call
+    # tokens.  "none" causes parsing failures when models inject thinking
+    # channel markers before tool calls (e.g. Gemma 4).
+    return "deepseek"
 
 
 def binary_candidates() -> list[Path]:
@@ -814,7 +826,7 @@ def build_server_command(
             str(cfg["port"]),
             "--jinja",
             "--reasoning-format",
-            effective_reasoning_format(config),
+            cfg.get("reasoning_format", "deepseek"),
             "--reasoning-budget",
             str(effective_reasoning_budget(config)),
             "-c",
@@ -829,6 +841,15 @@ def build_server_command(
 
 
 def start_server(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    progress_callback: ProgressCallback = None,
+) -> Dict[str, Any]:
+    with _server_start_lock:
+        return _start_server_locked(config, progress_callback=progress_callback)
+
+
+def _start_server_locked(
     config: Optional[Dict[str, Any]] = None,
     *,
     progress_callback: ProgressCallback = None,
@@ -851,16 +872,23 @@ def start_server(
     report(f"Checking local model {model_spec}...")
     probe = _probe_server(base_url)
     if probe["healthy"]:
-        # Verify the running server has the correct model loaded.
-        # A stale server from a previous config may still be listening
-        # on the same port with a different (possibly broken) model.
         running_model = probe.get("actual_model_id") or ""
         if running_model == model_spec:
-            state["actual_model_id"] = running_model
-            state["last_health_check"] = _utc_now_iso()
-            save_state(state)
-            return get_status(cfg)
-        report(f"Wrong model loaded ({running_model}), restarting...")
+            desired_fmt = cfg.get("reasoning_format", "deepseek")
+            running_props = probe.get("props") or {}
+            running_gen = running_props.get("default_generation_settings") or {}
+            running_params = running_gen.get("params") or running_gen
+            running_fmt = str(running_params.get("reasoning_format") or "none").strip().lower()
+            if running_fmt != desired_fmt:
+                report(f"Reasoning format mismatch ({running_fmt} vs {desired_fmt}), restarting...")
+                _kill_server_on_port(cfg["port"])
+            else:
+                state["actual_model_id"] = running_model
+                state["last_health_check"] = _utc_now_iso()
+                save_state(state)
+                return get_status(cfg)
+        else:
+            report(f"Wrong model loaded ({running_model}), restarting...")
         # Kill whatever is on the port — may be a manually started server
         # or one from a previous config whose PID we no longer track.
         _kill_server_on_port(cfg["port"])
