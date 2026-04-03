@@ -4241,7 +4241,8 @@ class AIAgent:
             """Stream a chat completions response."""
             import httpx as _httpx
             _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 60.0))
+            _default_read_timeout = _base_timeout if self._is_llama_cpp_provider() else 60.0
+            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", _default_read_timeout))
             stream_kwargs = {
                 **api_kwargs,
                 "stream": True,

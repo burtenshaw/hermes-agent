@@ -1026,21 +1026,11 @@ def _start_server_locked(
     if probe["healthy"]:
         running_model = probe.get("actual_model_id") or ""
         if running_model == model_spec:
-            desired_fmt = cfg.get("reasoning_format", "deepseek")
-            running_props = probe.get("props") or {}
-            running_gen = running_props.get("default_generation_settings") or {}
-            running_params = running_gen.get("params") or running_gen
-            running_fmt = str(running_params.get("reasoning_format") or "none").strip().lower()
-            if running_fmt != desired_fmt:
-                report(f"Reasoning format mismatch ({running_fmt} vs {desired_fmt}), restarting...")
-                _kill_server_on_port(cfg["port"])
-            else:
-                state["actual_model_id"] = running_model
-                state["last_health_check"] = _utc_now_iso()
-                save_state(state)
-                return get_status(cfg)
-        else:
-            report(f"Wrong model loaded ({running_model}), restarting...")
+            state["actual_model_id"] = running_model
+            state["last_health_check"] = _utc_now_iso()
+            save_state(state)
+            return get_status(cfg)
+        report(f"Wrong model loaded ({running_model}), restarting...")
         # Kill whatever is on the port — may be a manually started server
         # or one from a previous config whose PID we no longer track.
         _kill_server_on_port(cfg["port"])
