@@ -508,6 +508,8 @@ from tools.browser_tool import _emergency_cleanup_all_sessions as _cleanup_all_b
 
 # Guard to prevent cleanup from running multiple times on exit
 _cleanup_done = False
+# Weak reference to the active AIAgent for memory provider shutdown at exit
+_active_agent_ref = None
 
 def _run_cleanup():
     """Run resource cleanup exactly once."""
@@ -534,6 +536,15 @@ def _run_cleanup():
     try:
         from agent.auxiliary_client import shutdown_cached_clients
         shutdown_cached_clients()
+    except Exception:
+        pass
+    # Shut down memory provider (on_session_end + shutdown_all) at actual
+    # session boundary — NOT per-turn inside run_conversation().
+    try:
+        if _active_agent_ref and hasattr(_active_agent_ref, 'shutdown_memory_provider'):
+            _active_agent_ref.shutdown_memory_provider(
+                getattr(_active_agent_ref, 'conversation_history', None) or []
+            )
     except Exception:
         pass
 
@@ -1612,6 +1623,28 @@ class HermesCLI:
                 pass
             return changed
 
+        if resolved_provider in {"opencode-zen", "opencode-go"}:
+            try:
+                from hermes_cli.models import normalize_opencode_model_id, opencode_model_api_mode
+
+                canonical = normalize_opencode_model_id(resolved_provider, current_model)
+                if canonical and canonical != current_model:
+                    if not self._model_is_default:
+                        self.console.print(
+                            f"[yellow]⚠️  Stripped provider prefix from '{current_model}'; using '{canonical}' for {resolved_provider}.[/]"
+                        )
+                    self.model = canonical
+                    current_model = canonical
+                    changed = True
+
+                resolved_mode = opencode_model_api_mode(resolved_provider, current_model)
+                if resolved_mode != self.api_mode:
+                    self.api_mode = resolved_mode
+                    changed = True
+            except Exception:
+                pass
+            return changed
+
         if resolved_provider != "openai-codex":
             return False
 
@@ -2230,7 +2263,7 @@ class HermesCLI:
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
                 reasoning_callback=self._current_reasoning_callback(),
-                honcho_session_key=None,  # resolved by run_agent via config sessions map / title
+
                 fallback_model=self._fallback_model,
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
@@ -2242,6 +2275,9 @@ class HermesCLI:
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
             )
+            # Store reference for atexit memory provider shutdown
+            global _active_agent_ref
+            _active_agent_ref = self.agent
             # Route agent status output through prompt_toolkit so ANSI escape
             # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
             self.agent._print_fn = _cprint
@@ -3050,10 +3086,54 @@ class HermesCLI:
         print(f"  Config File: {config_path} {config_status}")
         print()
     
+    def _list_recent_sessions(self, limit: int = 10) -> list[dict[str, Any]]:
+        """Return recent CLI sessions for in-chat browsing/resume affordances."""
+        if not self._session_db:
+            return []
+        try:
+            sessions = self._session_db.list_sessions_rich(
+                source="cli",
+                exclude_sources=["tool"],
+                limit=limit,
+            )
+        except Exception:
+            return []
+        return [s for s in sessions if s.get("id") != self.session_id]
+
+    def _show_recent_sessions(self, *, reason: str = "history", limit: int = 10) -> bool:
+        """Render recent sessions inline from the active chat TUI.
+
+        Returns True when something was shown, False if no session list was available.
+        """
+        sessions = self._list_recent_sessions(limit=limit)
+        if not sessions:
+            return False
+
+        from hermes_cli.main import _relative_time
+
+        print()
+        if reason == "history":
+            print("(._.) No messages in the current chat yet — here are recent sessions you can resume:")
+        else:
+            print("  Recent sessions:")
+        print()
+        print(f"  {'Title':<32} {'Preview':<40} {'Last Active':<13} {'ID'}")
+        print(f"  {'─' * 32} {'─' * 40} {'─' * 13} {'─' * 24}")
+        for session in sessions:
+            title = (session.get("title") or "—")[:30]
+            preview = (session.get("preview") or "")[:38]
+            last_active = _relative_time(session.get("last_active"))
+            print(f"  {title:<32} {preview:<40} {last_active:<13} {session['id']}")
+        print()
+        print("  Use /resume <session id or title> to continue where you left off.")
+        print()
+        return True
+
     def show_history(self):
         """Display conversation history."""
         if not self.conversation_history:
-            print("(._.) No conversation history yet.")
+            if not self._show_recent_sessions(reason="history"):
+                print("(._.) No conversation history yet.")
             return
 
         preview_limit = 400
@@ -3178,6 +3258,8 @@ class HermesCLI:
 
         if not target:
             _cprint("  Usage: /resume <session_id_or_title>")
+            if self._show_recent_sessions(reason="resume"):
+                return
             _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
             return
 
@@ -3249,6 +3331,9 @@ class HermesCLI:
 
     def reset_conversation(self):
         """Reset the conversation by starting a new session."""
+        # Shut down memory provider before resetting — actual session boundary
+        if hasattr(self, 'agent') and self.agent:
+            self.agent.shutdown_memory_provider(self.conversation_history)
         self.new_session()
     
     def save_conversation(self):
@@ -3913,28 +3998,6 @@ class HermesCLI:
                             try:
                                 if self._session_db.set_session_title(self.session_id, new_title):
                                     _cprint(f"  Session title set: {new_title}")
-                                    # Re-map Honcho session key to new title
-                                    if self.agent and getattr(self.agent, '_honcho', None):
-                                        try:
-                                            hcfg = self.agent._honcho_config
-                                            new_key = (
-                                                hcfg.resolve_session_name(
-                                                    session_title=new_title,
-                                                    session_id=self.agent.session_id,
-                                                )
-                                                if hcfg else new_title
-                                            )
-                                            if new_key and new_key != self.agent._honcho_session_key:
-                                                old_key = self.agent._honcho_session_key
-                                                self.agent._honcho.get_or_create(new_key)
-                                                self.agent._honcho_session_key = new_key
-                                                from tools.honcho_tools import set_session_context
-                                                set_session_context(self.agent._honcho, new_key)
-                                                from agent.display import honcho_session_line, write_tty
-                                                write_tty(honcho_session_line(hcfg.workspace_id, new_key) + "\n")
-                                                _cprint(f"  Honcho session: {old_key} → {new_key}")
-                                        except Exception:
-                                            pass
                                 else:
                                     _cprint("  Session not found in database.")
                             except ValueError as e:
@@ -4399,7 +4462,6 @@ class HermesCLI:
                     user_message=btw_prompt,
                     conversation_history=history_snapshot,
                     task_id=task_id,
-                    sync_honcho=False,
                 )
 
                 response = (result.get("final_response") or "") if result else ""
@@ -4829,12 +4891,7 @@ class HermesCLI:
                 f"  ✅ Compressed: {original_count} → {new_count} messages "
                 f"(~{approx_tokens:,} → ~{new_tokens:,} tokens)"
             )
-            # Flush Honcho async queue so queued messages land before context resets
-            if self.agent and getattr(self.agent, '_honcho', None):
-                try:
-                    self.agent._honcho.flush_all()
-                except Exception:
-                    pass
+
         except Exception as e:
             print(f"  ❌ Compression failed: {e}")
 
@@ -4993,11 +5050,18 @@ class HermesCLI:
             return  # mcp_servers unchanged (some other section was edited)
 
         self._config_mcp_servers = new_mcp
-        # Notify user and reload
+        # Notify user and reload.  Run in a separate thread with a hard
+        # timeout so a hung MCP server cannot block the process_loop
+        # indefinitely (which would freeze the entire TUI).
         print()
         print("🔄 MCP server config changed — reloading connections...")
-        with self._busy_command(self._slow_command_status("/reload-mcp")):
-            self._reload_mcp()
+        _reload_thread = threading.Thread(
+            target=self._reload_mcp, daemon=True
+        )
+        _reload_thread.start()
+        _reload_thread.join(timeout=30)
+        if _reload_thread.is_alive():
+            print("  ⚠️  MCP reload timed out (30s). Some servers may not have reconnected.")
 
     def _reload_mcp(self):
         """Reload MCP servers: disconnect all, re-read config.yaml, reconnect.
@@ -6495,17 +6559,6 @@ class HermesCLI:
         # One-line Honcho session indicator (TTY-only, not captured by agent).
         # Only show when the user explicitly configured Honcho for Hermes
         # (not auto-enabled from a stray HONCHO_API_KEY env var).
-        try:
-            from honcho_integration.client import HonchoClientConfig
-            from agent.display import honcho_session_line, write_tty
-            hcfg = HonchoClientConfig.from_global_config()
-            if hcfg.enabled and (hcfg.api_key or hcfg.base_url) and hcfg.explicitly_configured:
-                sname = hcfg.resolve_session_name(session_id=self.session_id)
-                if sname:
-                    write_tty(honcho_session_line(hcfg.workspace_id, sname) + "\n")
-        except Exception:
-            pass
-
         # If resuming a session, load history and display it immediately
         # so the user has context before typing their first message.
         if self._resumed:
@@ -6991,6 +7044,9 @@ class HermesCLI:
             buffer.
             """
             pasted_text = event.data or ""
+            # Normalise line endings — Windows \r\n and old Mac \r both become \n
+            # so the 5-line collapse threshold and display are consistent.
+            pasted_text = pasted_text.replace('\r\n', '\n').replace('\r', '\n')
             if self._try_attach_clipboard_image():
                 event.app.invalidate()
             if pasted_text:
@@ -7824,12 +7880,6 @@ class HermesCLI:
             set_sudo_password_callback(None)
             set_approval_callback(None)
             set_secret_capture_callback(None)
-            # Flush + shut down Honcho async writer (drains queue before exit)
-            if self.agent and getattr(self.agent, '_honcho', None):
-                try:
-                    self.agent._honcho.shutdown()
-                except (Exception, KeyboardInterrupt):
-                    pass
             # Close session in SQLite
             if hasattr(self, '_session_db') and self._session_db and self.agent:
                 try:
@@ -8054,6 +8104,12 @@ def main(
                     if response:
                         print(response)
                     print(f"\nsession_id: {cli.session_id}")
+                    
+                    # Ensure proper exit code for automation wrappers
+                    sys.exit(1 if isinstance(result, dict) and result.get("failed") else 0)
+            
+            # Exit with error code if credentials or agent init fails
+            sys.exit(1)
         else:
             cli.show_banner()
             cli.console.print(f"[bold blue]Query:[/] {query}")
