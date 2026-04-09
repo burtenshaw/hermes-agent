@@ -3,14 +3,9 @@
 This module owns the dedicated ``llama-cpp`` provider:
 
 - curated model selection
-- optional Hugging Face GGUF discovery
 - managed ``llama-server`` lifecycle
 - persisted runtime state under ``HERMES_HOME``
 - smoke tests for tool-calling readiness
-
-The implementation is intentionally conservative. Hermes treats curated local
-models as the default path, but also supports selected Hugging Face GGUF repos
-when the managed runtime can start and pass the same smoke-test contract.
 """
 
 from __future__ import annotations
@@ -23,6 +18,7 @@ import platform
 import re
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import tarfile
@@ -32,303 +28,74 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, Optional
 
 import requests
 
-from hermes_constants import display_hermes_home, get_hermes_home
-from utils import atomic_json_write
+from hermes_cli.llama_cpp_common import (
+    LLAMA_CPP_DEFAULT_PORT,
+    LLAMA_CPP_DEFAULT_VERSION,
+    LLAMA_CPP_PROVIDER,
+    LLAMA_CPP_RELEASE_REPO,
+    LlamaCppError,
+    ProgressCallback,
+    _WINDOWS,
+    _mkdirs,
+    _utc_now_iso,
+    get_engine_bin_dir,
+    get_engine_binary_name,
+    get_engine_logs_dir,
+    get_engine_root,
+    get_llama_cpp_cache_dir,
+    load_state,
+    save_state,
+)
+from hermes_cli.llama_cpp_config import (
+    _DEFAULT_CONTEXT_LENGTH,
+    _DEFAULT_PARSER_CHAIN,
+    agent_runtime_settings,
+    canonical_model_value,
+    configure_selected_model,
+    curated_entry_for_tier,
+    curated_entry_for_spec,
+    effective_gpu_layers,
+    curated_model_specs,
+    effective_reasoning_budget,
+    ensure_engine_config_section,
+    get_engine_config,
+    is_llama_cpp_provider,
+    normalize_acceleration,
+    parse_model_spec,
+    recommended_parser_chain,
+    runtime_base_url,
+    selected_model_entry,
+    spec_string,
+    sync_config_model_fields,
+)
+from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
 
-LLAMA_CPP_PROVIDER = "llama-cpp"
-LLAMA_CPP_PROVIDER_ALIASES = ("llama-cpp", "llama.cpp", "llamacpp", "local")
-LLAMA_CPP_DEFAULT_PORT = 8081
-LLAMA_CPP_DEFAULT_VERSION = os.getenv("HERMES_LLAMA_CPP_VERSION", "latest").strip() or "latest"
-LLAMA_CPP_RELEASE_REPO = "ggml-org/llama.cpp"
-LLAMA_CPP_STATE_VERSION = 1
-_DEFAULT_CONTEXT_LENGTH = 32768
 _SMOKE_TIMEOUT_SECONDS = 45.0
-_DEFAULT_PARSER_CHAIN = ["llama3_json", "hermes"]
 _PROGRESS_POLL_INTERVAL_SECONDS = 1.0
 _server_start_lock = threading.Lock()
-_HF_MODELS_API_URL = "https://huggingface.co/api/models"
-_HF_SEARCH_DEFAULT_LIMIT = 12
-_HF_SEARCH_DEFAULT_PIPELINE_TAG = "image-text-to-text"
-_HF_SEARCH_DEFAULT_NUM_PARAMETERS = "min:0,max:32B"
-_GGUF_SHARD_RE = re.compile(r"-\d{5}-of-\d{5}\.gguf$", re.IGNORECASE)
-_PREFERRED_QUANTS = (
-    "Q4_K_M",
-    "Q6_K",
-    "Q8_0",
-    "F16",
-    "BF16",
-)
-
-CURATED_MODELS: Dict[str, Dict[str, Any]] = {
-    "tiny": {
-        "tier": "tiny",
-        "model_repo": "ggml-org/gemma-4-E2B-it-GGUF",
-        "quant": "Q8_0",
-        "context_length": 131072,
-        "template_strategy": "native",
-        "parser_chain": list(_DEFAULT_PARSER_CHAIN),
-    },
-    "balanced": {
-        "tier": "balanced",
-        "model_repo": "ggml-org/gemma-4-E4B-it-GGUF",
-        "quant": "Q4_K_M",
-        "context_length": 131072,
-        "template_strategy": "native",
-        "parser_chain": list(_DEFAULT_PARSER_CHAIN),
-    },
-    "large": {
-        "tier": "large",
-        "model_repo": "ggml-org/gemma-4-26B-A4B-it-GGUF",
-        "quant": "Q4_K_M",
-        "context_length": 262144,
-        "template_strategy": "native",
-        "parser_chain": list(_DEFAULT_PARSER_CHAIN),
-    },
-}
-
-_CURATED_SPECS = {
-    f"{entry['model_repo']}:{entry['quant']}": dict(entry)
-    for entry in CURATED_MODELS.values()
-}
-
-_WINDOWS = platform.system() == "Windows"
-
-
-class LlamaCppError(RuntimeError):
-    """User-facing managed-runtime error."""
-
-
-ProgressCallback = Optional[Callable[[str], None]]
-
-
-def default_engine_config() -> Dict[str, Any]:
-    return {
-        "managed": True,
-        "auto_start": True,
-        "port": LLAMA_CPP_DEFAULT_PORT,
-        "model": "",
-        "context_length": 0,
-        "reasoning_budget": 0,
-        "reasoning_format": "deepseek",
-        "template_strategy": "native",
-        "template_file": "",
-        "parallel_tool_calls": True,
-        "streaming_tool_calls": True,
+_SMOKE_PING_TOOL_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "smoke_ping",
+            "description": "Returns the provided integer value.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "value": {"type": "integer"},
+                },
+                "required": ["value"],
+            },
+        },
     }
-
-
-def is_llama_cpp_provider(value: Optional[str]) -> bool:
-    normalized = str(value or "").strip().lower()
-    return normalized in LLAMA_CPP_PROVIDER_ALIASES
-
-
-def normalize_provider_name(value: Optional[str]) -> str:
-    return LLAMA_CPP_PROVIDER if is_llama_cpp_provider(value) else str(value or "").strip().lower()
-
-
-def get_engine_root() -> Path:
-    return get_hermes_home() / "local_engines" / "llama_cpp"
-
-
-def get_engine_bin_dir() -> Path:
-    return get_engine_root() / "bin"
-
-
-def get_engine_logs_dir() -> Path:
-    return get_engine_root() / "logs"
-
-
-def get_engine_state_path() -> Path:
-    return get_engine_root() / "state.json"
-
-
-def get_engine_binary_name() -> str:
-    return "llama-server.exe" if _WINDOWS else "llama-server"
-
-
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def _mkdirs() -> None:
-    get_engine_bin_dir().mkdir(parents=True, exist_ok=True)
-    get_engine_logs_dir().mkdir(parents=True, exist_ok=True)
-
-
-def get_llama_cpp_cache_dir() -> Path:
-    if platform.system() == "Darwin":
-        return Path.home() / "Library" / "Caches" / "llama.cpp"
-    if _WINDOWS:
-        local_appdata = os.getenv("LOCALAPPDATA", "").strip()
-        if local_appdata:
-            return Path(local_appdata) / "llama.cpp"
-        return Path.home() / "AppData" / "Local" / "llama.cpp"
-    return Path.home() / ".cache" / "llama.cpp"
-
-
-def load_state() -> Dict[str, Any]:
-    path = get_engine_state_path()
-    if not path.exists():
-        return {"state_version": LLAMA_CPP_STATE_VERSION}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            data.setdefault("state_version", LLAMA_CPP_STATE_VERSION)
-            return data
-    except Exception as exc:
-        logger.debug("Failed to read llama.cpp state: %s", exc)
-    return {"state_version": LLAMA_CPP_STATE_VERSION}
-
-
-def save_state(state: Dict[str, Any]) -> None:
-    _mkdirs()
-    payload = dict(state or {})
-    payload["state_version"] = LLAMA_CPP_STATE_VERSION
-    payload.pop("hardware_snapshot", None)
-    atomic_json_write(get_engine_state_path(), payload)
-
-
-def _merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    merged = dict(base)
-    for key, value in (override or {}).items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _merge_dict(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def get_engine_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    if config is None:
-        from hermes_cli.config import load_config
-
-        config = load_config()
-    engine_cfg: Dict[str, Any] = {}
-    if isinstance(config, dict):
-        if isinstance(config.get("local_engines"), dict):
-            local_engines = config.get("local_engines") or {}
-            candidate = local_engines.get("llama_cpp")
-            if isinstance(candidate, dict):
-                engine_cfg = candidate
-        elif any(
-            key in config
-            for key in (
-                *default_engine_config().keys(),
-                "selected_tier",
-                "model_repo",
-                "quant",
-            )
-        ):
-            engine_cfg = config
-    merged = _merge_dict(default_engine_config(), engine_cfg)
-    try:
-        merged["port"] = int(merged.get("port") or LLAMA_CPP_DEFAULT_PORT)
-    except Exception:
-        merged["port"] = LLAMA_CPP_DEFAULT_PORT
-    raw_context_length = merged.get("context_length")
-    try:
-        if raw_context_length in (None, ""):
-            merged["context_length"] = 0
-        else:
-            merged["context_length"] = max(0, int(raw_context_length))
-    except Exception:
-        merged["context_length"] = 0
-    try:
-        merged["reasoning_budget"] = int(merged.get("reasoning_budget"))
-    except Exception:
-        merged["reasoning_budget"] = 0
-    merged["reasoning_format"] = str(merged.get("reasoning_format") or "deepseek").strip().lower() or "deepseek"
-    merged["selected_tier"] = str(merged.get("selected_tier") or "").strip().lower()
-    merged["template_strategy"] = str(merged.get("template_strategy") or "native").strip().lower()
-    merged["template_file"] = str(merged.get("template_file") or "").strip()
-    merged["model_repo"] = str(merged.get("model_repo") or "").strip()
-    merged["quant"] = str(merged.get("quant") or "").strip()
-    merged["model"] = canonical_model_value(merged.get("model"))
-    if not merged["model"]:
-        if merged["selected_tier"] in CURATED_MODELS:
-            merged["model"] = merged["selected_tier"]
-        else:
-            merged["model"] = spec_string(merged["model_repo"], merged["quant"])
-    resolved_model = _resolve_model_value(merged["model"])
-    merged["model"] = resolved_model["model"]
-    merged["selected_tier"] = resolved_model["selected_tier"]
-    merged["model_repo"] = resolved_model["model_repo"]
-    merged["quant"] = resolved_model["quant"]
-    merged["managed"] = bool(merged.get("managed", True))
-    merged["auto_start"] = bool(merged.get("auto_start", True))
-    merged["parallel_tool_calls"] = bool(merged.get("parallel_tool_calls", False))
-    merged["streaming_tool_calls"] = bool(merged.get("streaming_tool_calls", False))
-    return merged
-
-
-def runtime_base_url(config: Optional[Dict[str, Any]] = None) -> str:
-    cfg = get_engine_config(config)
-    return f"http://127.0.0.1:{cfg['port']}/v1"
-
-
-def spec_string(model_repo: str, quant: str) -> str:
-    repo = str(model_repo or "").strip()
-    q = str(quant or "").strip()
-    return f"{repo}:{q}" if repo and q else repo
-
-
-def parse_model_spec(value: Optional[str]) -> Dict[str, str]:
-    text = str(value or "").strip()
-    if not text:
-        return {"model_repo": "", "quant": ""}
-    if ":" not in text:
-        return {"model_repo": text, "quant": ""}
-    repo, quant = text.rsplit(":", 1)
-    return {"model_repo": repo.strip(), "quant": quant.strip()}
-
-
-def canonical_model_value(value: Optional[str]) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    normalized = text.lower()
-    if normalized in CURATED_MODELS:
-        return normalized
-    parsed = parse_model_spec(text)
-    return spec_string(parsed.get("model_repo", ""), parsed.get("quant", ""))
-
-
-def _resolve_model_value(value: Optional[str]) -> Dict[str, str]:
-    canonical = canonical_model_value(value)
-    resolved = {
-        "model": canonical,
-        "selected_tier": "",
-        "model_repo": "",
-        "quant": "",
-    }
-    if not canonical:
-        return resolved
-    if canonical in CURATED_MODELS:
-        entry = CURATED_MODELS[canonical]
-        resolved["selected_tier"] = canonical
-        resolved["model_repo"] = str(entry.get("model_repo") or "").strip()
-        resolved["quant"] = str(entry.get("quant") or "").strip()
-        return resolved
-
-    parsed = parse_model_spec(canonical)
-    resolved["model_repo"] = parsed.get("model_repo", "")
-    resolved["quant"] = parsed.get("quant", "")
-    curated = _CURATED_SPECS.get(canonical)
-    if curated:
-        resolved["selected_tier"] = str(curated.get("tier") or "").strip().lower()
-    return resolved
-
-
-def curated_model_specs() -> list[str]:
-    return list(_CURATED_SPECS.keys())
+]
 
 
 def _emit_progress(progress_callback: ProgressCallback, message: str) -> None:
@@ -456,68 +223,45 @@ def describe_startup_progress(config: Optional[Dict[str, Any]] = None) -> Dict[s
     }
 
 
-def curated_entry_for_tier(tier: str) -> Dict[str, Any]:
-    normalized = str(tier or "").strip().lower()
-    if normalized not in CURATED_MODELS:
-        raise LlamaCppError(f"Unknown llama.cpp tier '{tier}'.")
-    return dict(CURATED_MODELS[normalized])
-
-
-def curated_entry_for_spec(model_repo: str, quant: str) -> Optional[Dict[str, Any]]:
-    return _CURATED_SPECS.get(spec_string(model_repo, quant))
-
-
-def recommended_parser_chain(config: Optional[Dict[str, Any]] = None) -> list[str]:
-    cfg = get_engine_config(config)
-    current = curated_entry_for_spec(cfg.get("model_repo", ""), cfg.get("quant", ""))
-    if current:
-        return list(current.get("parser_chain") or _DEFAULT_PARSER_CHAIN)
-    tier = cfg.get("selected_tier") or "balanced"
-    if tier not in CURATED_MODELS:
-        tier = "balanced"
-    return list(curated_entry_for_tier(tier).get("parser_chain") or _DEFAULT_PARSER_CHAIN)
-
-
-def effective_reasoning_budget(config: Optional[Dict[str, Any]] = None) -> int:
-    cfg = get_engine_config(config)
-    try:
-        # block unlimited reasoning budget
-        budget = int(cfg.get("reasoning_budget", 0))
-        return max(0, budget)
-    except Exception:
-        return 0
-
-
-def binary_candidates() -> list[Path]:
-    state = load_state()
-    candidates = []
+def _env_binary_path() -> Optional[Path]:
     env_binary = os.getenv("HERMES_LLAMA_CPP_BINARY", "").strip()
-    if env_binary:
-        candidates.append(Path(env_binary))
-    path_binary = shutil.which(get_engine_binary_name()) or shutil.which("llama-server")
-    if path_binary:
-        candidates.append(Path(path_binary))
+    if not env_binary:
+        return None
+    return Path(env_binary)
+
+
+def _path_binary_path() -> Optional[Path]:
+    candidate = shutil.which(get_engine_binary_name()) or shutil.which("llama-server")
+    return Path(candidate) if candidate else None
+
+
+def resolve_binary_path(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    state: Optional[Dict[str, Any]] = None,
+) -> Optional[Path]:
+    cfg = get_engine_config(config)
+    state = load_state() if state is None else state
+
+    env_binary = _env_binary_path()
+    if env_binary and env_binary.exists():
+        return env_binary
+
+    managed_binary = get_engine_bin_dir() / get_engine_binary_name()
+    if cfg.get("managed", True):
+        return managed_binary if managed_binary.exists() else None
+
     state_binary = str(state.get("binary_path") or "").strip()
     if state_binary:
-        candidates.append(Path(state_binary))
-    managed_binary = get_engine_bin_dir() / get_engine_binary_name()
-    candidates.append(managed_binary)
+        state_path = Path(state_binary)
+        if state_path.exists():
+            return state_path
 
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key not in seen:
-            seen.add(key)
-            unique.append(candidate)
-    return unique
+    path_binary = _path_binary_path()
+    if path_binary and path_binary.exists():
+        return path_binary
 
-
-def resolve_binary_path() -> Optional[Path]:
-    for candidate in binary_candidates():
-        if candidate.exists():
-            return candidate
-    return None
+    return managed_binary if managed_binary.exists() else None
 
 
 def read_binary_version(binary_path: Path) -> str:
@@ -543,141 +287,6 @@ def _download_file(url: str, target: Path) -> None:
         shutil.copyfileobj(response, handle)
 
 
-def _hf_api_get(path: str = "", *, params: Optional[Dict[str, Any]] = None) -> Any:
-    url = _HF_MODELS_API_URL if not path else f"{_HF_MODELS_API_URL}/{path.lstrip('/')}"
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            headers={"User-Agent": "hermes-agent/llama-cpp"},
-            timeout=20,
-        )
-        response.raise_for_status()
-        return response.json()
-    except requests.HTTPError as exc:
-        raise LlamaCppError(f"Hugging Face request failed ({exc.response.status_code}).") from exc
-    except requests.RequestException as exc:
-        raise LlamaCppError(f"Could not reach Hugging Face Hub: {exc}") from exc
-
-
-def search_huggingface_models(
-    query: str = "",
-    *,
-    limit: int = _HF_SEARCH_DEFAULT_LIMIT,
-    pipeline_tag: str = _HF_SEARCH_DEFAULT_PIPELINE_TAG,
-    num_parameters: str = _HF_SEARCH_DEFAULT_NUM_PARAMETERS,
-    sort: str = "trendingScore",
-) -> list[Dict[str, Any]]:
-    params: Dict[str, Any] = {
-        "apps": "llama.cpp",
-        "sort": sort,
-        "limit": max(1, min(int(limit or _HF_SEARCH_DEFAULT_LIMIT), 50)),
-    }
-    query = str(query or "").strip()
-    if query:
-        params["search"] = query
-    pipeline_tag = str(pipeline_tag or "").strip()
-    if pipeline_tag:
-        params["pipeline_tag"] = pipeline_tag
-    num_parameters = str(num_parameters or "").strip()
-    if num_parameters:
-        params["num_parameters"] = num_parameters
-
-    payload = _hf_api_get(params=params)
-    if not isinstance(payload, list):
-        raise LlamaCppError("Hugging Face model search returned malformed data.")
-
-    results: list[Dict[str, Any]] = []
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        repo_id = str(item.get("id") or item.get("modelId") or "").strip()
-        if not repo_id:
-            continue
-        results.append(
-            {
-                "id": repo_id,
-                "pipeline_tag": str(item.get("pipeline_tag") or "").strip(),
-                "downloads": int(item.get("downloads") or 0),
-                "likes": int(item.get("likes") or 0),
-                "author": str(item.get("author") or "").strip(),
-                "last_modified": str(item.get("lastModified") or "").strip(),
-            }
-        )
-    return results
-
-
-def _common_prefix_tokens(values: list[str]) -> list[str]:
-    tokenized = [value.split("-") for value in values if value]
-    if not tokenized:
-        return []
-    prefix: list[str] = []
-    for parts in zip(*tokenized):
-        if len(set(parts)) != 1:
-            break
-        prefix.append(parts[0])
-    return prefix
-
-
-def _extract_repo_quants(filenames: list[str]) -> list[str]:
-    candidates = [
-        Path(name).name
-        for name in filenames
-        if isinstance(name, str)
-        and name.lower().endswith(".gguf")
-        and "/" not in name
-        and "mmproj" not in name.lower()
-        and not _GGUF_SHARD_RE.search(name)
-    ]
-    if not candidates:
-        return []
-
-    stems = [Path(name).stem for name in candidates]
-    prefix_tokens = _common_prefix_tokens(stems)
-    prefix_len = len(prefix_tokens)
-    quants: list[str] = []
-    for stem in stems:
-        tokens = stem.split("-")
-        suffix_tokens = tokens[prefix_len:] if prefix_len < len(tokens) else []
-        quant = "-".join(suffix_tokens).strip("-_.")
-        if not quant:
-            quant = stem
-        if quant not in quants:
-            quants.append(quant)
-    return quants
-
-
-def preferred_quant(quants: Iterable[str]) -> str:
-    values = [str(quant or "").strip() for quant in quants if str(quant or "").strip()]
-    if not values:
-        return ""
-    lowered = {value.lower(): value for value in values}
-    for preferred in _PREFERRED_QUANTS:
-        match = lowered.get(preferred.lower())
-        if match:
-            return match
-    return values[0]
-
-
-def list_huggingface_gguf_quants(repo_id: str) -> list[str]:
-    repo = str(repo_id or "").strip()
-    if not repo:
-        return []
-    payload = _hf_api_get(repo, params={"expand": "siblings"})
-    siblings = payload.get("siblings") if isinstance(payload, dict) else None
-    if not isinstance(siblings, list):
-        return []
-    filenames = []
-    for item in siblings:
-        if isinstance(item, dict) and item.get("rfilename"):
-            filenames.append(str(item["rfilename"]))
-    quants = _extract_repo_quants(filenames)
-    preferred = preferred_quant(quants)
-    if preferred:
-        return [preferred] + [quant for quant in quants if quant != preferred]
-    return quants
-
-
 def _sha256_of(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:
@@ -694,20 +303,46 @@ def _detect_release_target() -> tuple[str, list[str]]:
     patterns: list[str]
     if system == "darwin":
         if machine in {"arm64", "aarch64"}:
-            patterns = ["macos-arm64", "darwin-arm64", "metal", "arm64", "apple"]
+            patterns = ["macos-arm64", "darwin-arm64", "arm64", "aarch64", "apple"]
         else:
-            patterns = ["macos-x64", "darwin-x64", "x86_64", "amd64"]
+            patterns = ["macos-x64", "darwin-x64", "x64", "x86_64", "amd64"]
     elif system == "linux":
         if machine in {"arm64", "aarch64"}:
-            patterns = ["linux-arm64", "linux-aarch64", "arm64", "aarch64"]
+            patterns = ["ubuntu-arm64", "linux-arm64", "linux-aarch64", "arm64", "aarch64"]
         else:
-            patterns = ["linux-x64", "linux-amd64", "x86_64", "amd64"]
+            patterns = ["ubuntu-x64", "linux-x64", "linux-amd64", "x64", "x86_64", "amd64"]
     elif system == "windows":
-        patterns = ["win64", "windows-x64", "windows-amd64", "x64", "amd64"]
+        if machine in {"arm64", "aarch64"}:
+            patterns = ["win-arm64", "windows-arm64", "arm64", "aarch64"]
+        else:
+            patterns = ["win-x64", "windows-x64", "windows-amd64", "x64", "amd64"]
     else:
         raise LlamaCppError(f"Automatic llama.cpp install is not supported on {platform.system()}/{platform.machine()}.")
 
     return target, patterns
+
+
+def _cuda_runtime_available() -> bool:
+    return bool(
+        shutil.which("nvidia-smi")
+        or os.getenv("CUDA_PATH", "").strip()
+        or os.getenv("CUDA_HOME", "").strip()
+    )
+
+
+def resolve_acceleration(config: Optional[Dict[str, Any]] = None) -> str:
+    cfg = get_engine_config(config)
+    requested = normalize_acceleration(cfg.get("acceleration"))
+    if requested != "auto":
+        return requested
+
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    if system == "darwin" and machine in {"arm64", "aarch64"}:
+        return "metal"
+    if system in {"linux", "windows"} and _cuda_runtime_available():
+        return "cuda"
+    return "cpu"
 
 
 def _release_api_url(version: str) -> str:
@@ -730,33 +365,69 @@ def _fetch_release_metadata(version: str) -> Dict[str, Any]:
     return payload
 
 
-def _score_asset(name: str, patterns: Iterable[str], prefer_cuda: bool) -> int:
+def _asset_matches_acceleration(name: str, acceleration: str) -> bool:
     lowered = name.lower()
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+
+    if acceleration == "cpu":
+        return "cuda" not in lowered
+    if acceleration == "metal":
+        return system == "darwin" and machine in {"arm64", "aarch64"} and "macos-arm64" in lowered
+    if acceleration == "cuda":
+        return "cuda" in lowered
+    return False
+
+
+def _score_asset(name: str, patterns: Iterable[str], acceleration: str) -> int:
+    lowered = name.lower()
+    if not lowered.endswith((".zip", ".tar.gz", ".tgz")):
+        return -1
+    if not _asset_matches_acceleration(lowered, acceleration):
+        return -1
+
     score = 0
+    matched_patterns = 0
     for pattern in patterns:
         if pattern in lowered:
+            matched_patterns += 1
             score += 25
+    if matched_patterns == 0:
+        return -1
+
     if "server" in lowered or "bin" in lowered:
         score += 10
-    if lowered.endswith((".zip", ".tar.gz", ".tgz")):
+    if lowered.startswith("llama-"):
         score += 5
-    if "cuda" in lowered:
-        score += 10 if prefer_cuda else -5
-    if "metal" in lowered and platform.system() == "Darwin":
-        score += 5
+    if lowered.startswith("cudart-"):
+        score -= 5
+    score += 5
+    if acceleration == "cpu":
+        if "cpu" in lowered:
+            score += 10
+        if "kleidiai" in lowered:
+            score -= 3
+    elif acceleration == "metal":
+        score += 20
+        if "kleidiai" in lowered:
+            score -= 3
+    elif acceleration == "cuda":
+        score += 20
+        if "cuda" in lowered:
+            score += 10
     return score
 
 
-def _resolve_release_asset(version: str) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+def _resolve_release_asset(
+    version: str,
+    *,
+    acceleration: str,
+) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
     metadata = _fetch_release_metadata(version)
     assets = metadata.get("assets")
     if not isinstance(assets, list) or not assets:
         raise LlamaCppError("No downloadable assets found in the selected llama.cpp release.")
 
-    _, patterns = _detect_release_target()
-    prefer_cuda = False
-    archive_asset: Optional[Dict[str, Any]] = None
-    best_score = -1
     checksum_asset: Optional[Dict[str, Any]] = None
 
     for asset in assets:
@@ -766,18 +437,26 @@ def _resolve_release_asset(version: str) -> tuple[Dict[str, Any], Optional[Dict[
         lowered = name.lower()
         if lowered in {"checksums.txt", "sha256sum.txt", "sha256sums.txt"} or lowered.endswith("checksums.txt"):
             checksum_asset = asset
+    _, patterns = _detect_release_target()
+    resolved = normalize_acceleration(acceleration)
+    archive_asset: Optional[Dict[str, Any]] = None
+    best_score = -1
+    for asset in assets:
+        if not isinstance(asset, dict):
             continue
-        score = _score_asset(name, patterns, prefer_cuda)
+        name = str(asset.get("name") or "")
+        score = _score_asset(name, patterns, resolved)
         if score > best_score:
             best_score = score
             archive_asset = asset
+    if archive_asset is not None and best_score > 0:
+        return archive_asset, checksum_asset
 
-    if archive_asset is None or best_score <= 0:
-        raise LlamaCppError(
-            "Could not find a compatible llama.cpp release asset for this platform. "
-            "Set HERMES_LLAMA_CPP_BINARY to an existing llama-server binary to continue."
-        )
-    return archive_asset, checksum_asset
+    raise LlamaCppError(
+        f"Managed llama.cpp does not publish a compatible '{resolved}' binary for "
+        f"{platform.system()}/{platform.machine()}. Set HERMES_LLAMA_CPP_BINARY to a custom build, "
+        "or choose a different acceleration."
+    )
 
 
 def _verify_checksum(archive_path: Path, checksum_path: Path, archive_name: str) -> bool:
@@ -795,8 +474,12 @@ def _verify_checksum(archive_path: Path, checksum_path: Path, archive_name: str)
         return False
 
 
-def _install_release_binary(version: str) -> Path:
-    archive_asset, checksum_asset = _resolve_release_asset(version)
+def _install_release_binary(
+    version: str,
+    *,
+    acceleration: str,
+) -> tuple[Path, str]:
+    archive_asset, checksum_asset = _resolve_release_asset(version, acceleration=acceleration)
     archive_url = str(archive_asset.get("browser_download_url") or "").strip()
     archive_name = str(archive_asset.get("name") or "").strip()
     if not archive_url or not archive_name:
@@ -843,22 +526,52 @@ def _install_release_binary(version: str) -> Path:
         destination = get_engine_bin_dir() / binary_name
         shutil.move(str(source_binary), str(destination))
         destination.chmod(destination.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        return destination
+        return destination, archive_name
 
 
-def ensure_binary_installed(config: Optional[Dict[str, Any]] = None) -> Path:
+def _managed_binary_path() -> Path:
+    return get_engine_bin_dir() / get_engine_binary_name()
+
+
+def _is_managed_binary_path(path: Path) -> bool:
+    try:
+        return path.resolve() == _managed_binary_path().resolve()
+    except Exception:
+        return str(path) == str(_managed_binary_path())
+
+
+def _managed_asset_matches_acceleration(asset_name: str, acceleration: str) -> bool:
+    name = str(asset_name or "").strip().lower()
+    if not name:
+        return False
+    return _asset_matches_acceleration(name, normalize_acceleration(acceleration))
+
+
+def ensure_binary_installed(config: Optional[Dict[str, Any]] = None) -> tuple[Path, str]:
     cfg = get_engine_config(config)
     state = load_state()
+    requested_acceleration = normalize_acceleration(cfg.get("acceleration"))
+    resolved_acceleration = resolve_acceleration(cfg)
 
-    binary_path = resolve_binary_path()
+    binary_path = resolve_binary_path(cfg, state=state)
     if binary_path is not None:
-        state["binary_path"] = str(binary_path)
-        version = read_binary_version(binary_path)
-        if version:
-            state["installed_version"] = version
-        state["binary_checked_at"] = _utc_now_iso()
-        save_state(state)
-        return binary_path
+        if (
+            cfg.get("managed", True)
+            and _is_managed_binary_path(binary_path)
+            and not _managed_asset_matches_acceleration(state.get("binary_asset_name", ""), resolved_acceleration)
+        ):
+            binary_path = None
+        else:
+            state["binary_path"] = str(binary_path)
+            state["binary_source"] = "managed" if _is_managed_binary_path(binary_path) else "external"
+            state["binary_checked_at"] = _utc_now_iso()
+            if not _is_managed_binary_path(binary_path):
+                state.pop("binary_asset_name", None)
+            version = read_binary_version(binary_path)
+            if version:
+                state["installed_version"] = version
+            save_state(state)
+            return binary_path, resolved_acceleration
 
     if not cfg.get("managed", True):
         raise LlamaCppError(
@@ -866,12 +579,28 @@ def ensure_binary_installed(config: Optional[Dict[str, Any]] = None) -> Path:
             "Set HERMES_LLAMA_CPP_BINARY or enable local_engines.llama_cpp.managed."
         )
 
-    binary_path = _install_release_binary(LLAMA_CPP_DEFAULT_VERSION)
+    install_acceleration = resolved_acceleration
+    try:
+        binary_path, asset_name = _install_release_binary(
+            LLAMA_CPP_DEFAULT_VERSION,
+            acceleration=install_acceleration,
+        )
+    except LlamaCppError:
+        if requested_acceleration != "auto" or resolved_acceleration == "cpu":
+            raise
+        install_acceleration = "cpu"
+        binary_path, asset_name = _install_release_binary(
+            LLAMA_CPP_DEFAULT_VERSION,
+            acceleration=install_acceleration,
+        )
+
     state["binary_path"] = str(binary_path)
-    state["installed_version"] = read_binary_version(binary_path)
+    state["binary_source"] = "managed"
+    state["binary_asset_name"] = asset_name
     state["binary_checked_at"] = _utc_now_iso()
+    state["installed_version"] = read_binary_version(binary_path)
     save_state(state)
-    return binary_path
+    return binary_path, install_acceleration
 
 
 def _pid_is_alive(pid: Any) -> bool:
@@ -924,96 +653,119 @@ def _probe_server(base_url: str) -> Dict[str, Any]:
     return result
 
 
-def _terminate_existing_process(state: Dict[str, Any]) -> None:
-    pid = state.get("pid")
-    if not _pid_is_alive(pid):
+def _terminate_pid(pid: int, *, force: bool = False) -> None:
+    if _WINDOWS:
+        command = ["taskkill", "/PID", str(pid), "/T"]
+        command.append("/F")
+        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         return
-    try:
-        os.kill(int(pid), signal.SIGTERM)
-    except Exception:
-        return
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if not _pid_is_alive(pid):
-            break
-        time.sleep(0.25)
-    if _pid_is_alive(pid):
-        try:
-            os.kill(int(pid), signal.SIGKILL)
-        except Exception:
-            pass
+    os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
 
 
-def _kill_server_on_port(port: int) -> None:
-    """Find and kill any llama-server process listening on *port*."""
+def _find_pids_on_port(port: int) -> list[int]:
     try:
-        out = subprocess.check_output(
-            ["lsof", "-ti", f"tcp:{port}"],
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).strip()
+        port = int(port)
     except Exception:
-        return
-    for pid_str in out.splitlines():
-        try:
-            pid = int(pid_str.strip())
-            os.kill(pid, signal.SIGTERM)
-        except Exception:
-            continue
-    # Wait briefly for the port to free up.
-    deadline = time.time() + 5
-    while time.time() < deadline:
+        return []
+
+    try:
+        import psutil
+
+        pids = sorted(
+            {
+                int(conn.pid)
+                for conn in psutil.net_connections(kind="tcp")
+                if conn.pid
+                and conn.status == psutil.CONN_LISTEN
+                and getattr(conn, "laddr", None)
+                and getattr(conn.laddr, "port", None) == port
+            }
+        )
+        if pids:
+            return pids
+    except Exception:
+        pass
+
+    if not _WINDOWS and shutil.which("lsof"):
         try:
             out = subprocess.check_output(
                 ["lsof", "-ti", f"tcp:{port}"],
                 stderr=subprocess.DEVNULL,
                 text=True,
             ).strip()
-            if not out:
-                return
         except Exception:
-            return
+            return []
+        pids: list[int] = []
+        for pid_str in out.splitlines():
+            try:
+                pids.append(int(pid_str.strip()))
+            except Exception:
+                continue
+        return pids
+
+    return []
+
+
+def _port_is_listening(port: int) -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _terminate_existing_process(state: Dict[str, Any], *, force: bool = False) -> bool:
+    pid = state.get("pid")
+    if not _pid_is_alive(pid):
+        return False
+    try:
+        _terminate_pid(int(pid), force=force)
+    except Exception:
+        return False
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if not _pid_is_alive(pid):
+            return True
+        time.sleep(0.25)
+    if _pid_is_alive(pid):
+        try:
+            _terminate_pid(int(pid), force=True)
+        except Exception:
+            pass
+    return not _pid_is_alive(pid)
+
+
+def _kill_server_on_port(port: int, *, force: bool = False) -> list[int]:
+    """Find and kill any llama-server process listening on *port*."""
+    pids = _find_pids_on_port(port)
+    for pid in pids:
+        try:
+            _terminate_pid(pid, force=force)
+        except Exception:
+            continue
+    # Wait briefly for the port to free up.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if not _port_is_listening(port):
+            return pids
         time.sleep(0.5)
-
-
-def selected_model_entry(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    cfg = get_engine_config(config)
-    model_repo = cfg.get("model_repo", "").strip()
-    quant = cfg.get("quant", "").strip()
-    # Check curated list first.
-    current = curated_entry_for_spec(model_repo, quant)
-    if current is not None:
-        merged = dict(current)
-        merged["context_length"] = cfg.get("context_length") or current.get("context_length") or _DEFAULT_CONTEXT_LENGTH
-        return merged
-    # Explicit repo+quant not in the curated list — use as-is (custom model).
-    if model_repo:
-        return {
-            "tier": cfg.get("selected_tier") or "",
-            "model_repo": model_repo,
-            "quant": quant,
-            "context_length": cfg.get("context_length") or _DEFAULT_CONTEXT_LENGTH,
-            "template_strategy": cfg.get("template_strategy", "native"),
-            "parser_chain": list(_DEFAULT_PARSER_CHAIN),
-        }
-    # Nothing configured — fall back to a curated tier.
-    tier = cfg.get("selected_tier") or "balanced"
-    if tier not in CURATED_MODELS:
-        tier = "balanced"
-    selected = curated_entry_for_tier(tier)
-    selected["context_length"] = cfg.get("context_length") or selected.get("context_length") or _DEFAULT_CONTEXT_LENGTH
-    return selected
+    for pid in pids:
+        try:
+            _terminate_pid(pid, force=True)
+        except Exception:
+            continue
+    return pids
 
 
 def build_server_command(
     *,
     binary_path: Path,
     config: Optional[Dict[str, Any]] = None,
+    resolved_acceleration: Optional[str] = None,
 ) -> list[str]:
     cfg = get_engine_config(config)
     entry = selected_model_entry(cfg)
-    model_spec = spec_string(entry["model_repo"], entry["quant"])
-    command = [str(binary_path), "-hf", model_spec]
+    command = [str(binary_path), "-hf", entry["model_spec"]]
     command.extend(
         [
             "--host",
@@ -1024,11 +776,16 @@ def build_server_command(
             "--reasoning-format",
             cfg.get("reasoning_format", "deepseek"),
             "--reasoning-budget",
-            str(effective_reasoning_budget(config)),
+            str(effective_reasoning_budget(cfg)),
             "-c",
             str(entry.get("context_length") or _DEFAULT_CONTEXT_LENGTH),
         ]
     )
+    gpu_layers = effective_gpu_layers(cfg, resolved_acceleration=resolved_acceleration)
+    if gpu_layers > 0:
+        configured_gpu_layers = int(cfg.get("gpu_layers", -1))
+        gpu_layers_arg = "all" if configured_gpu_layers < 0 else str(gpu_layers)
+        command.extend(["--n-gpu-layers", gpu_layers_arg])
     template_strategy = cfg.get("template_strategy", "native")
     template_file = str(cfg.get("template_file") or "").strip()
     if template_strategy == "override" and template_file:
@@ -1054,7 +811,7 @@ def _start_server_locked(
     state = load_state()
     base_url = runtime_base_url(cfg)
     entry = selected_model_entry(cfg)
-    model_spec = spec_string(entry["model_repo"], entry["quant"])
+    model_spec = entry["model_spec"]
     last_progress_message = ""
 
     def report(message: str) -> None:
@@ -1071,7 +828,6 @@ def _start_server_locked(
         running_model = probe.get("actual_model_id") or ""
         if running_model == model_spec:
             state["actual_model_id"] = running_model
-            state["last_health_check"] = _utc_now_iso()
             save_state(state)
             return get_status(cfg)
         report(f"Wrong model loaded ({running_model}), restarting...")
@@ -1083,9 +839,13 @@ def _start_server_locked(
         _terminate_existing_process(state)
 
     report("Ensuring llama.cpp binary is ready...")
-    binary_path = ensure_binary_installed(cfg)
+    binary_path, resolved_acceleration = ensure_binary_installed(cfg)
     report("Launching llama-server...")
-    command = build_server_command(binary_path=binary_path, config=cfg)
+    command = build_server_command(
+        binary_path=binary_path,
+        config=cfg,
+        resolved_acceleration=resolved_acceleration,
+    )
     log_path = get_engine_logs_dir() / f"llama-server-{int(time.time())}.log"
     _mkdirs()
     with open(log_path, "ab") as log_handle:
@@ -1100,17 +860,20 @@ def _start_server_locked(
         {
             "pid": process.pid,
             "binary_path": str(binary_path),
-            "command": command,
             "log_path": str(log_path),
             "base_url": base_url,
-            "started_at": _utc_now_iso(),
             "desired_model_spec": model_spec,
+            "gpu_layers": effective_gpu_layers(cfg, resolved_acceleration=resolved_acceleration),
+            "started_at": _utc_now_iso(),
+            "stopped_at": None,
         }
     )
     save_state(state)
 
-    deadline = time.time() + 180
-    while time.time() < deadline:
+    stall_timeout = int(cfg.get("startup_stall_timeout_seconds") or 600)
+    last_activity_at = time.time()
+    last_activity_marker: Optional[tuple[Any, ...]] = None
+    while True:
         if process.poll() is not None:
             detail = f" Last step: {last_progress_message}." if last_progress_message else ""
             raise LlamaCppError(
@@ -1120,28 +883,64 @@ def _start_server_locked(
         probe = _probe_server(base_url)
         if probe["healthy"]:
             state["actual_model_id"] = probe.get("actual_model_id") or ""
-            state["last_health_check"] = _utc_now_iso()
             state["props"] = probe.get("props")
+            state["stopped_at"] = None
             save_state(state)
             return get_status(cfg)
         progress = describe_startup_progress(cfg)
+        log_size = 0
+        try:
+            if log_path.exists():
+                log_size = log_path.stat().st_size
+        except Exception:
+            log_size = 0
+        activity_marker = (
+            progress.get("phase"),
+            progress.get("artifact"),
+            progress.get("current_bytes"),
+            progress.get("total_bytes"),
+            progress.get("message"),
+            log_size,
+        )
+        if activity_marker != last_activity_marker:
+            last_activity_marker = activity_marker
+            last_activity_at = time.time()
         if progress.get("message"):
             report(str(progress["message"]))
+        if time.time() - last_activity_at >= stall_timeout:
+            detail = f" Last step: {last_progress_message}." if last_progress_message else ""
+            raise LlamaCppError(
+                f"No startup progress from llama.cpp for {stall_timeout} seconds at {base_url}."
+                f"{detail} Check {display_hermes_home()}/local_engines/llama_cpp/logs."
+            )
         time.sleep(_PROGRESS_POLL_INTERVAL_SECONDS)
 
-    detail = f" Last step: {last_progress_message}." if last_progress_message else ""
-    raise LlamaCppError(
-        f"Timed out waiting for llama.cpp to become healthy at {base_url}. "
-        f"{detail} Check {display_hermes_home()}/local_engines/llama_cpp/logs."
-    )
 
-
-def stop_server() -> None:
+def stop_server(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    force: bool = False,
+) -> Dict[str, Any]:
+    cfg = get_engine_config(config)
     state = load_state()
-    _terminate_existing_process(state)
+    terminated_pid = int(state["pid"]) if _pid_is_alive(state.get("pid")) else None
+    stopped_process = _terminate_existing_process(state, force=force)
+    killed_pids = []
+    if _port_is_listening(cfg["port"]):
+        killed_pids = _kill_server_on_port(cfg["port"], force=force)
     state["pid"] = None
+    state["actual_model_id"] = ""
+    state["props"] = None
     state["stopped_at"] = _utc_now_iso()
     save_state(state)
+    return {
+        "stopped": bool(stopped_process or killed_pids or terminated_pid),
+        "terminated_pid": terminated_pid,
+        "killed_pids": killed_pids,
+        "base_url": runtime_base_url(cfg),
+        "port": cfg["port"],
+        "force": bool(force),
+    }
 
 
 def _chat_completion(
@@ -1175,7 +974,11 @@ def _chat_completion(
     return body if isinstance(body, dict) else {}
 
 
-def _extract_tool_calls_from_response(response: Dict[str, Any]) -> list[Dict[str, Any]]:
+def _extract_tool_calls_from_response(
+    response: Dict[str, Any],
+    *,
+    parser_chain: Optional[Iterable[str]] = None,
+) -> list[Dict[str, Any]]:
     choices = response.get("choices") or []
     if not choices:
         return []
@@ -1193,7 +996,7 @@ def _extract_tool_calls_from_response(response: Dict[str, Any]) -> list[Dict[str
     except Exception:
         return []
 
-    for parser_name in _DEFAULT_PARSER_CHAIN:
+    for parser_name in parser_chain or _DEFAULT_PARSER_CHAIN:
         try:
             _, parsed = get_parser(parser_name).parse(content)
         except Exception:
@@ -1221,15 +1024,15 @@ def run_smoke_tests(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if not status.get("healthy"):
         raise LlamaCppError("Cannot run llama.cpp smoke tests because the managed server is not healthy.")
 
-    model = status.get("actual_model_id") or status.get("model") or selected_model_entry(cfg)["model_repo"]
+    entry = selected_model_entry(cfg)
+    parser_chain = entry.get("parser_chain") or _DEFAULT_PARSER_CHAIN
+    model = status.get("actual_model_id") or status.get("model_spec") or entry["model_repo"]
     base_url = runtime_base_url(cfg)
     results: Dict[str, Any] = {
         "checked_at": _utc_now_iso(),
         "props_verified": False,
         "single_tool_call": False,
         "tool_followup": False,
-        "malformed_recovery": False,
-        "parallel_tool_calls": False,
         "passed": False,
         "errors": [],
     }
@@ -1240,23 +1043,6 @@ def run_smoke_tests(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     else:
         results["errors"].append("llama.cpp /v1/props did not return default_generation_settings")
 
-    tool_schema = [
-        {
-            "type": "function",
-            "function": {
-                "name": "smoke_ping",
-                "description": "Returns the provided integer value.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "value": {"type": "integer"},
-                    },
-                    "required": ["value"],
-                },
-            },
-        }
-    ]
-
     try:
         single = _chat_completion(
             base_url=base_url,
@@ -1265,11 +1051,11 @@ def run_smoke_tests(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
                 {"role": "system", "content": "Use tools exactly when appropriate."},
                 {"role": "user", "content": "Call smoke_ping with value 42. Do not answer in plain text first."},
             ],
-            tools=tool_schema,
+            tools=_SMOKE_PING_TOOL_SCHEMA,
             max_tokens=128,
             parallel_tool_calls=False,
         )
-        single_calls = _extract_tool_calls_from_response(single)
+        single_calls = _extract_tool_calls_from_response(single, parser_chain=parser_chain)
         if single_calls:
             first_call = single_calls[0]
             fn = first_call.get("function") if isinstance(first_call, dict) else {}
@@ -1318,84 +1104,11 @@ def run_smoke_tests(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     except Exception as exc:
         results["errors"].append(f"tool follow-up smoke test failed: {exc}")
 
-    try:
-        malformed = _chat_completion(
-            base_url=base_url,
-            model=model,
-            messages=[
-                {"role": "system", "content": "Retry tool calls when the previous attempt had invalid JSON."},
-                {"role": "user", "content": "Call smoke_ping with value 13."},
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [
-                        {
-                            "id": "call_bad_json",
-                            "type": "function",
-                            "function": {"name": "smoke_ping", "arguments": '{"value": }'},
-                        }
-                    ],
-                },
-                {
-                    "role": "tool",
-                    "tool_call_id": "call_bad_json",
-                    "content": "Error: Invalid JSON arguments. Please retry with valid JSON.",
-                },
-                {"role": "user", "content": "Retry the tool call with valid JSON only."},
-            ],
-            tools=tool_schema,
-            max_tokens=128,
-        )
-        malformed_calls = _extract_tool_calls_from_response(malformed)
-        if malformed_calls:
-            fn = malformed_calls[0].get("function") if isinstance(malformed_calls[0], dict) else {}
-            if isinstance(fn, dict):
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except Exception:
-                    args = {}
-                if fn.get("name") == "smoke_ping" and args.get("value") == 13:
-                    results["malformed_recovery"] = True
-        if not results["malformed_recovery"]:
-            results["errors"].append("malformed-argument recovery smoke test did not produce a corrected tool call")
-    except Exception as exc:
-        results["errors"].append(f"malformed-argument recovery smoke test failed: {exc}")
-
-    try:
-        parallel = _chat_completion(
-            base_url=base_url,
-            model=model,
-            messages=[
-                {"role": "system", "content": "If the model supports parallel tool calls, emit two smoke_ping calls in one response."},
-                {"role": "user", "content": "Call smoke_ping twice, once with 1 and once with 2, in the same response if supported."},
-            ],
-            tools=tool_schema,
-            max_tokens=128,
-            parallel_tool_calls=True,
-        )
-        parallel_calls = _extract_tool_calls_from_response(parallel)
-        seen = set()
-        for item in parallel_calls:
-            fn = item.get("function") if isinstance(item, dict) else {}
-            if not isinstance(fn, dict):
-                continue
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except Exception:
-                args = {}
-            if fn.get("name") == "smoke_ping" and args.get("value") in {1, 2}:
-                seen.add(args.get("value"))
-        results["parallel_tool_calls"] = seen == {1, 2}
-    except Exception:
-        results["parallel_tool_calls"] = False
-
     results["passed"] = all(
-        results.get(key) for key in ("props_verified", "single_tool_call", "tool_followup", "malformed_recovery")
+        results.get(key) for key in ("props_verified", "single_tool_call", "tool_followup")
     )
     state = load_state()
     state["smoke_tests"] = results
-    if results["parallel_tool_calls"]:
-        state["parallel_tool_calls_validated"] = True
     save_state(state)
     return results
 
@@ -1403,9 +1116,13 @@ def run_smoke_tests(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
 def get_status(config: Optional[Dict[str, Any]] = None, *, check_health: bool = True) -> Dict[str, Any]:
     cfg = get_engine_config(config)
     state = load_state()
-    binary_path = resolve_binary_path()
+    binary_path = resolve_binary_path(cfg, state=state)
     base_url = runtime_base_url(cfg)
     entry = selected_model_entry(cfg)
+    requested_acceleration = normalize_acceleration(cfg.get("acceleration"))
+    resolved_acceleration = resolve_acceleration(cfg)
+    configured_gpu_layers = int(cfg.get("gpu_layers", -1))
+    runtime_gpu_layers = effective_gpu_layers(cfg, resolved_acceleration=resolved_acceleration)
 
     status = {
         "provider": LLAMA_CPP_PROVIDER,
@@ -1417,21 +1134,31 @@ def get_status(config: Optional[Dict[str, Any]] = None, *, check_health: bool = 
         "binary_path": str(binary_path) if binary_path else str(state.get("binary_path") or ""),
         "installed": bool(binary_path),
         "installed_version": str(state.get("installed_version") or ""),
+        "binary_source": str(state.get("binary_source") or ""),
+        "binary_asset_name": str(state.get("binary_asset_name") or ""),
+        "binary_checked_at": str(state.get("binary_checked_at") or ""),
         "pid": state.get("pid"),
         "process_running": _pid_is_alive(state.get("pid")),
         "healthy": False,
         "model_repo": entry["model_repo"],
         "quant": entry["quant"],
-        "model_spec": spec_string(entry["model_repo"], entry["quant"]),
+        "model_spec": entry["model_spec"],
         "selected_tier": entry.get("tier") or cfg.get("selected_tier") or "",
         "context_length": int(entry.get("context_length") or cfg.get("context_length") or _DEFAULT_CONTEXT_LENGTH),
         "reasoning_budget": effective_reasoning_budget(config),
         "template_strategy": cfg.get("template_strategy", "native"),
         "template_file": cfg.get("template_file") or "",
         "parallel_tool_calls": bool(cfg.get("parallel_tool_calls", False)),
-        "streaming_tool_calls": bool(cfg.get("streaming_tool_calls", False)),
+        "requested_acceleration": requested_acceleration,
+        "resolved_acceleration": resolved_acceleration,
+        "configured_gpu_layers": configured_gpu_layers,
+        "gpu_layers": runtime_gpu_layers,
+        "startup_stall_timeout_seconds": int(cfg.get("startup_stall_timeout_seconds") or 600),
         "actual_model_id": str(state.get("actual_model_id") or ""),
         "log_path": str(state.get("log_path") or ""),
+        "started_at": str(state.get("started_at") or ""),
+        "stopped_at": str(state.get("stopped_at") or ""),
+        "desired_model_spec": str(state.get("desired_model_spec") or entry["model_spec"]),
         "smoke_tests": state.get("smoke_tests") if isinstance(state.get("smoke_tests"), dict) else {},
         "props": state.get("props") if isinstance(state.get("props"), dict) else None,
     }
@@ -1448,7 +1175,54 @@ def get_status(config: Optional[Dict[str, Any]] = None, *, check_health: bool = 
             status["actual_model_id"] = probe["actual_model_id"]
         if probe.get("props") is not None:
             status["props"] = probe["props"]
+        if status["healthy"]:
+            state["actual_model_id"] = status["actual_model_id"]
+            state["props"] = status["props"]
+            state["stopped_at"] = None
+            save_state(state)
     return status
+
+
+def read_recent_logs(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    lines: int = 80,
+) -> str:
+    del config
+    state = load_state()
+    candidates: list[Path] = []
+    log_path = str(state.get("log_path") or "").strip()
+    if log_path:
+        candidates.append(Path(log_path))
+    logs_dir = get_engine_logs_dir()
+    if logs_dir.exists():
+        try:
+            recent = sorted(
+                logs_dir.glob("llama-server-*.log"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except Exception:
+            recent = []
+        candidates.extend(recent)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not candidate.exists():
+            continue
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        state["log_path"] = str(candidate)
+        save_state(state)
+        tail = content.splitlines()
+        return "\n".join(tail[-max(1, int(lines or 80)) :])
+    return ""
 
 
 def ensure_runtime_ready(
@@ -1467,10 +1241,7 @@ def ensure_runtime_ready(
         return status
 
     status = get_status(cfg)
-    desired_spec = spec_string(
-        selected_model_entry(cfg)["model_repo"],
-        selected_model_entry(cfg)["quant"],
-    )
+    desired_spec = selected_model_entry(cfg)["model_spec"]
     running_model = status.get("actual_model_id") or ""
     if not status.get("healthy") or running_model != desired_spec:
         status = start_server(cfg, progress_callback=progress_callback)
@@ -1481,8 +1252,6 @@ def ensure_runtime_ready(
         smoke = run_smoke_tests(cfg)
         status = get_status(cfg)
         status["smoke_tests"] = smoke
-        if smoke.get("parallel_tool_calls"):
-            status["parallel_tool_calls"] = True
 
     if not smoke.get("passed"):
         raise LlamaCppError(
@@ -1500,6 +1269,7 @@ def runtime_payload(
 ) -> Dict[str, Any]:
     status = ensure_runtime_ready(config, progress_callback=progress_callback)
     actual_model = status.get("actual_model_id") or status.get("model_spec")
+    settings = agent_runtime_settings(config)
     return {
         "provider": LLAMA_CPP_PROVIDER,
         "api_mode": "chat_completions",
@@ -1507,66 +1277,9 @@ def runtime_payload(
         "api_key": "no-key-required",
         "source": "managed:llama-cpp",
         "model": actual_model,
-        "parallel_tool_calls": bool(status.get("parallel_tool_calls", False)),
-        "streaming_tool_calls": bool(status.get("streaming_tool_calls", False)),
-        "parser_chain": recommended_parser_chain(config),
+        "parallel_tool_calls": bool(settings.get("parallel_tool_calls", False)),
+        "parser_chain": list(settings.get("parser_chain") or _DEFAULT_PARSER_CHAIN),
     }
-
-
-def sync_config_model_fields(config: Dict[str, Any], runtime: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    cfg = get_engine_config(config)
-    runtime = runtime or get_status(cfg)
-    entry = selected_model_entry(cfg)
-    model_cfg = config.get("model")
-    if not isinstance(model_cfg, dict):
-        model_cfg = {"default": model_cfg} if model_cfg else {}
-    model_cfg["provider"] = LLAMA_CPP_PROVIDER
-    model_cfg["base_url"] = runtime_base_url(cfg)
-    model_cfg["api_mode"] = "chat_completions"
-    model_cfg["default"] = str(runtime.get("model_spec") or spec_string(entry["model_repo"], entry["quant"]))
-    model_cfg["context_length"] = int(entry.get("context_length") or cfg.get("context_length") or _DEFAULT_CONTEXT_LENGTH)
-    config["model"] = model_cfg
-    return config
-
-
-def configure_selected_model(
-    config: Dict[str, Any],
-    *,
-    tier: str,
-    model_repo: Optional[str] = None,
-    quant: Optional[str] = None,
-    context_length: Optional[int] = None,
-) -> Dict[str, Any]:
-    local_engines = config.setdefault("local_engines", {})
-    if not isinstance(local_engines, dict):
-        local_engines = {}
-        config["local_engines"] = local_engines
-    engine_cfg = local_engines.setdefault("llama_cpp", {})
-    if not isinstance(engine_cfg, dict):
-        engine_cfg = {}
-        local_engines["llama_cpp"] = engine_cfg
-
-    curated = curated_entry_for_tier(tier)
-    engine_cfg["managed"] = True
-    engine_cfg["auto_start"] = True
-    selected_model = (
-        spec_string(model_repo or curated["model_repo"], quant or curated["quant"])
-        if (model_repo or quant)
-        else tier
-    )
-    engine_cfg["model"] = canonical_model_value(selected_model)
-    engine_cfg["context_length"] = int(context_length or curated.get("context_length") or _DEFAULT_CONTEXT_LENGTH)
-    if "reasoning_budget" in engine_cfg:
-        try:
-            engine_cfg["reasoning_budget"] = int(engine_cfg.get("reasoning_budget"))
-        except Exception:
-            engine_cfg["reasoning_budget"] = 0
-    else:
-        engine_cfg["reasoning_budget"] = 0
-    engine_cfg["template_strategy"] = curated.get("template_strategy", "native")
-    for legacy_key in ("selected_tier", "model_repo", "quant"):
-        engine_cfg.pop(legacy_key, None)
-    return config
 
 
 def get_managed_provider_status() -> Dict[str, Any]:

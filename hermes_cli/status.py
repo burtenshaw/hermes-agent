@@ -134,6 +134,17 @@ def show_status(args):
         print(f"  {'Model spec':<12}  {llama_status.get('model_spec')}")
         if llama_status.get("actual_model_id"):
             print(f"  {'Loaded model':<12}  {llama_status.get('actual_model_id')}")
+        requested_accel = str(llama_status.get("requested_acceleration") or "").strip()
+        resolved_accel = str(llama_status.get("resolved_acceleration") or "").strip()
+        accel_label = resolved_accel or requested_accel or "cpu"
+        if requested_accel and resolved_accel and requested_accel != resolved_accel:
+            accel_label = f"{requested_accel} -> {resolved_accel}"
+        gpu_layers = int(llama_status.get("gpu_layers") or 0)
+        configured_gpu_layers = int(llama_status.get("configured_gpu_layers") or 0)
+        if gpu_layers > 0:
+            layer_label = "all" if configured_gpu_layers < 0 else str(gpu_layers)
+            accel_label += f" ({layer_label} gpu layers)"
+        print(f"  {'Acceleration':<12}  {accel_label}")
         print(f"  {'Thinking':<12}  {'disabled' if int(llama_status.get('reasoning_budget', 0)) == 0 else llama_status.get('reasoning_budget')}")
         print(
             f"  {'Template':<12}  "
@@ -149,10 +160,10 @@ def show_status(args):
             f"  {'Parallel':<12}  "
             f"{'enabled' if llama_status.get('parallel_tool_calls') else 'disabled'}"
         )
-        print(
-            f"  {'Streaming':<12}  "
-            f"{'enabled' if llama_status.get('streaming_tool_calls') else 'disabled'}"
-        )
+        if llama_status.get("started_at"):
+            print(f"  {'Started':<12}  {_format_iso_timestamp(llama_status.get('started_at'))}")
+        if llama_status.get("stopped_at") and not healthy and not llama_status.get("process_running"):
+            print(f"  {'Stopped':<12}  {_format_iso_timestamp(llama_status.get('stopped_at'))}")
     except Exception as exc:
         print(f"  {'llama.cpp':<12}  {check_mark(False)} unavailable ({exc})")
 

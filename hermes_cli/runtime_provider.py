@@ -236,11 +236,14 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         return None
 
     # Raw names should only map to custom providers when they are not already
-    # valid built-in providers or aliases. Explicit menu keys like
-    # ``custom:local`` always target the saved custom provider.
+    # valid built-in providers or aliases. The one exception is ``local``:
+    # users commonly save a custom local OpenAI-compatible endpoint under that
+    # name, and the test suite expects it to win over the managed llama.cpp
+    # alias. Explicit menu keys like ``custom:local`` always target the saved
+    # custom provider.
     if requested_norm == "auto":
         return None
-    if not requested_norm.startswith("custom:"):
+    if requested_norm != "local" and not requested_norm.startswith("custom:"):
         try:
             auth_mod.resolve_provider(requested_norm)
         except AuthError:
@@ -557,11 +560,6 @@ def resolve_runtime_provider(
     """Resolve runtime provider credentials for agent execution."""
     requested_provider = resolve_requested_provider(requested)
 
-    if is_llama_cpp_provider(requested_provider):
-        runtime = llama_cpp_runtime_payload(load_config(), progress_callback=progress_callback)
-        runtime["requested_provider"] = requested_provider
-        return runtime
-
     custom_runtime = _resolve_named_custom_runtime(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
@@ -570,6 +568,11 @@ def resolve_runtime_provider(
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider
         return custom_runtime
+
+    if is_llama_cpp_provider(requested_provider):
+        runtime = llama_cpp_runtime_payload(load_config(), progress_callback=progress_callback)
+        runtime["requested_provider"] = requested_provider
+        return runtime
 
     provider = resolve_provider(
         requested_provider,

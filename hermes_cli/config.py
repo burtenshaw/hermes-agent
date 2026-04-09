@@ -441,13 +441,15 @@ DEFAULT_CONFIG = {
             "auto_start": True,
             "port": 8081,
             "model": "",
+            "acceleration": "auto",
+            "gpu_layers": -1,
             "context_length": 0,
+            "startup_stall_timeout_seconds": 600,
             "reasoning_budget": 0,
             "reasoning_format": "deepseek",
             "template_strategy": "native",
             "template_file": "",
             "parallel_tool_calls": False,
-            "streaming_tool_calls": False,
         },
     },
 
@@ -540,7 +542,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 11,
+    "_config_version": 12,
 }
 
 # =============================================================================

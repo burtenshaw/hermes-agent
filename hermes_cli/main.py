@@ -9,6 +9,11 @@ Usage:
     hermes gateway start       # Start gateway as service
     hermes gateway stop        # Stop gateway service
     hermes gateway status      # Show gateway status
+    hermes local status        # Show managed local llama.cpp status
+    hermes local start         # Start managed local llama.cpp
+    hermes local stop          # Stop managed local llama.cpp
+    hermes local restart       # Restart managed local llama.cpp
+    hermes local logs          # Show managed local llama.cpp logs
     hermes gateway install     # Install gateway service
     hermes gateway uninstall   # Uninstall gateway service
     hermes setup               # Interactive setup wizard
@@ -661,6 +666,94 @@ def cmd_gateway(args):
     gateway_command(args)
 
 
+def _local_acceleration_label(status: dict) -> str:
+    requested = str(status.get("requested_acceleration") or "").strip()
+    resolved = str(status.get("resolved_acceleration") or "").strip()
+    if requested and resolved:
+        label = resolved if requested == resolved else f"{requested} -> {resolved}"
+    else:
+        label = resolved or requested or "cpu"
+    gpu_layers = int(status.get("gpu_layers") or 0)
+    configured_gpu_layers = int(status.get("configured_gpu_layers") or 0)
+    if gpu_layers > 0:
+        layer_label = "all" if configured_gpu_layers < 0 else str(gpu_layers)
+        label += f" ({layer_label} gpu layers)"
+    return label
+
+
+def _print_local_status(status: dict) -> None:
+    if status.get("healthy"):
+        summary = "healthy"
+    elif status.get("process_running"):
+        summary = "running"
+    elif status.get("installed"):
+        summary = "installed"
+    else:
+        summary = "not installed"
+
+    print(f"llama.cpp: {summary}")
+    print(f"Endpoint: {status.get('base_url')}")
+    if status.get("installed_version"):
+        print(f"Version: {status.get('installed_version')}")
+    if status.get("binary_path"):
+        print(f"Binary: {status.get('binary_path')}")
+    print(f"Model: {status.get('model_spec')}")
+    if status.get("actual_model_id"):
+        print(f"Loaded: {status.get('actual_model_id')}")
+    print(f"Acceleration: {_local_acceleration_label(status)}")
+    if status.get("started_at"):
+        print(f"Started: {status.get('started_at')}")
+    if status.get("stopped_at") and not status.get("healthy") and not status.get("process_running"):
+        print(f"Stopped: {status.get('stopped_at')}")
+    if status.get("log_path"):
+        print(f"Logs: {status.get('log_path')}")
+    smoke = status.get("smoke_tests") if isinstance(status.get("smoke_tests"), dict) else {}
+    if smoke:
+        print(f"Smoke tests: {'passed' if smoke.get('passed') else 'not passed'}")
+
+
+def cmd_local(args):
+    """Managed local llama.cpp lifecycle commands."""
+    from hermes_cli.config import load_config
+    from hermes_cli.llama_cpp import ensure_runtime_ready, get_status, read_recent_logs, stop_server
+
+    config = load_config()
+    action = getattr(args, "local_command", None) or "status"
+
+    if action == "status":
+        _print_local_status(get_status(config, check_health=True))
+        return
+
+    if action == "start":
+        status = ensure_runtime_ready(config, progress_callback=print)
+        _print_local_status(status)
+        return
+
+    if action == "stop":
+        result = stop_server(config, force=getattr(args, "force", False))
+        if result.get("stopped"):
+            print(f"Stopped managed local llama.cpp on {result.get('base_url')}")
+        else:
+            print(f"No managed local llama.cpp process was running on {result.get('base_url')}")
+        return
+
+    if action == "restart":
+        stop_server(config, force=getattr(args, "force", False))
+        status = ensure_runtime_ready(config, progress_callback=print)
+        _print_local_status(status)
+        return
+
+    if action == "logs":
+        text = read_recent_logs(config, lines=getattr(args, "lines", 80))
+        if text:
+            print(text)
+        else:
+            print("No llama.cpp logs found.")
+        return
+
+    raise ValueError(f"Unknown local command: {action}")
+
+
 def cmd_whatsapp(args):
     """Set up WhatsApp: choose mode, configure, install bridge, pair via QR."""
     _require_tty("whatsapp")
@@ -1103,13 +1196,16 @@ def _model_flow_llama_cpp(config, current_model=""):
     from hermes_cli.llama_cpp import (
         configure_selected_model,
         curated_entry_for_tier,
+        ensure_engine_config_section,
         ensure_runtime_ready,
         get_status,
-        list_huggingface_gguf_quants,
-        search_huggingface_models,
-        preferred_quant,
         spec_string,
         sync_config_model_fields,
+    )
+    from hermes_cli.llama_cpp_hf import (
+        list_huggingface_gguf_quants,
+        preferred_quant,
+        search_huggingface_models,
     )
 
     fresh_config = load_config()
@@ -1245,14 +1341,7 @@ def _model_flow_llama_cpp(config, current_model=""):
                 return
             quant = quants[quant_idx]
 
-        local_engines = working.setdefault("local_engines", {})
-        if not isinstance(local_engines, dict):
-            local_engines = {}
-            working["local_engines"] = local_engines
-        llama_cfg = local_engines.setdefault("llama_cpp", {})
-        if not isinstance(llama_cfg, dict):
-            llama_cfg = {}
-            local_engines["llama_cpp"] = llama_cfg
+        llama_cfg = ensure_engine_config_section(working)
         llama_cfg["model"] = spec_string(selected_repo, quant)
         llama_cfg["context_length"] = 0
     elif action == "custom":
@@ -1269,27 +1358,13 @@ def _model_flow_llama_cpp(config, current_model=""):
         if not parsed.get("model_repo"):
             print("Invalid model spec.")
             return
-        local_engines = working.setdefault("local_engines", {})
-        if not isinstance(local_engines, dict):
-            local_engines = {}
-            working["local_engines"] = local_engines
-        llama_cfg = local_engines.setdefault("llama_cpp", {})
-        if not isinstance(llama_cfg, dict):
-            llama_cfg = {}
-            local_engines["llama_cpp"] = llama_cfg
+        llama_cfg = ensure_engine_config_section(working)
         llama_cfg["model"] = spec_string(parsed["model_repo"], parsed.get("quant", ""))
         llama_cfg["context_length"] = 0
     else:
         working = configure_selected_model(working, tier=tier)
 
-    local_engines = working.setdefault("local_engines", {})
-    if not isinstance(local_engines, dict):
-        local_engines = {}
-        working["local_engines"] = local_engines
-    llama_cfg = local_engines.setdefault("llama_cpp", {})
-    if not isinstance(llama_cfg, dict):
-        llama_cfg = {}
-        local_engines["llama_cpp"] = llama_cfg
+    llama_cfg = ensure_engine_config_section(working)
     for legacy_key in ("selected_tier", "model_repo", "quant"):
         llama_cfg.pop(legacy_key, None)
 
@@ -1302,11 +1377,6 @@ def _model_flow_llama_cpp(config, current_model=""):
         return
 
     smoke = runtime.get("smoke_tests") if isinstance(runtime.get("smoke_tests"), dict) else {}
-    if smoke.get("parallel_tool_calls"):
-        llama_cfg["parallel_tool_calls"] = True
-    else:
-        llama_cfg["parallel_tool_calls"] = False
-    llama_cfg["streaming_tool_calls"] = False
 
     working = sync_config_model_fields(working, runtime)
     save_config(working)
@@ -4500,7 +4570,31 @@ For more help on a command:
     gateway_setup = gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
 
     gateway_parser.set_defaults(func=cmd_gateway)
-    
+
+    # =========================================================================
+    # local command
+    # =========================================================================
+    local_parser = subparsers.add_parser(
+        "local",
+        help="Managed local llama.cpp lifecycle",
+        description="Start, stop, inspect, and tail logs for the managed local llama.cpp runtime",
+    )
+    local_subparsers = local_parser.add_subparsers(dest="local_command")
+
+    local_subparsers.add_parser("status", help="Show managed local llama.cpp status")
+    local_subparsers.add_parser("start", help="Start managed local llama.cpp")
+
+    local_stop = local_subparsers.add_parser("stop", help="Stop managed local llama.cpp")
+    local_stop.add_argument("--force", action="store_true", help="Force-stop the local llama.cpp process")
+
+    local_restart = local_subparsers.add_parser("restart", help="Restart managed local llama.cpp")
+    local_restart.add_argument("--force", action="store_true", help="Force-stop before restart")
+
+    local_logs = local_subparsers.add_parser("logs", help="Show recent managed local llama.cpp logs")
+    local_logs.add_argument("-n", "--lines", type=int, default=80, help="Number of log lines to show (default: 80)")
+
+    local_parser.set_defaults(func=cmd_local, local_command="status")
+
     # =========================================================================
     # setup command
     # =========================================================================

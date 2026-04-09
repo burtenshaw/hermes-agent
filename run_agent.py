@@ -1000,21 +1000,17 @@ class AIAgent:
             _agent_cfg = {}
 
         self._llama_cpp_parallel_tool_calls = False
-        self._llama_cpp_streaming_tool_calls = False
         self._llama_cpp_parser_chain = ["llama3_json", "hermes"]
         if self.provider == "llama-cpp":
             try:
-                from hermes_cli.llama_cpp import get_engine_config, recommended_parser_chain
+                from hermes_cli.llama_cpp import agent_runtime_settings
 
-                _llama_cfg = get_engine_config(_agent_cfg)
+                _llama_settings = agent_runtime_settings(_agent_cfg)
                 self._llama_cpp_parallel_tool_calls = bool(
-                    _llama_cfg.get("parallel_tool_calls", False)
-                )
-                self._llama_cpp_streaming_tool_calls = bool(
-                    _llama_cfg.get("streaming_tool_calls", False)
+                    _llama_settings.get("parallel_tool_calls", False)
                 )
                 self._llama_cpp_parser_chain = list(
-                    recommended_parser_chain(_agent_cfg)
+                    _llama_settings.get("parser_chain") or self._llama_cpp_parser_chain
                 )
             except Exception:
                 pass
