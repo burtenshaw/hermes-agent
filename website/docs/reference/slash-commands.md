@@ -35,7 +35,9 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/resume [name]` | Resume a previously-named session |
 | `/statusbar` (alias: `/sb`) | Toggle the context/model status bar on or off |
 | `/background <prompt>` (alias: `/bg`) | Run a prompt in a separate background session. The agent processes your prompt independently — your current session stays free for other work. Results appear as a panel when the task finishes. See [CLI Background Sessions](/docs/user-guide/cli#background-sessions). |
+| `/btw <question>` | Ephemeral side question using session context (no tools, not persisted). Useful for quick clarifications without affecting the conversation history. |
 | `/plan [request]` | Load the bundled `plan` skill to write a markdown plan instead of executing the work. Plans are saved under `.hermes/plans/` relative to the active workspace/backend working directory. |
+| `/branch [name]` (alias: `/fork`) | Branch the current session (explore a different path) |
 
 ### Configuration
 
@@ -44,7 +46,6 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/config` | Show current configuration |
 | `/model [model-name]` | Show or change the current model. Supports: `/model claude-sonnet-4`, `/model provider:model` (switch providers), `/model custom:model` (custom endpoint), `/model custom:name:model` (named custom provider), `/model custom` (auto-detect from endpoint) |
 | `/provider` | Show available providers and current provider |
-| `/prompt` | View/set custom system prompt |
 | `/personality` | Set a predefined personality |
 | `/verbose` | Cycle tool progress display: off → new → all → verbose. Can be [enabled for messaging](#notes) via config. |
 | `/reasoning` | Manage reasoning effort and display (usage: /reasoning [level\|show\|hide]) |
@@ -88,9 +89,22 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/<skill-name>` | Load any installed skill as an on-demand command. Example: `/gif-search`, `/github-pr-workflow`, `/excalidraw`. |
 | `/skills ...` | Search, browse, inspect, install, audit, publish, and configure skills from registries and the official optional-skills catalog. |
 
-### Quick commands
+### Quick Commands
 
-User-defined quick commands from `quick_commands` in `~/.hermes/config.yaml` are also available as slash commands. These are resolved at dispatch time, not shown in the built-in autocomplete/help tables.
+User-defined quick commands map a short alias to a longer prompt. Configure them in `~/.hermes/config.yaml`:
+
+```yaml
+quick_commands:
+  review: "Review my latest git diff and suggest improvements"
+  deploy: "Run the deployment script at scripts/deploy.sh and verify the output"
+  morning: "Check my calendar, unread emails, and summarize today's priorities"
+```
+
+Then type `/review`, `/deploy`, or `/morning` in the CLI. Quick commands are resolved at dispatch time and are not shown in the built-in autocomplete/help tables.
+
+### Alias Resolution
+
+Commands support prefix matching: typing `/h` resolves to `/help`, `/mod` resolves to `/model`. When a prefix is ambiguous (matches multiple commands), the first match in registry order wins. Full command names and registered aliases always take priority over prefix matches.
 
 ## Messaging slash commands
 
@@ -129,7 +143,7 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 
 ## Notes
 
-- `/skin`, `/tools`, `/toolsets`, `/browser`, `/config`, `/prompt`, `/cron`, `/skills`, `/platforms`, `/paste`, `/statusbar`, and `/plugins` are **CLI-only** commands.
+- `/skin`, `/tools`, `/toolsets`, `/browser`, `/config`, `/cron`, `/skills`, `/platforms`, `/paste`, `/statusbar`, and `/plugins` are **CLI-only** commands.
 - `/verbose` is **CLI-only by default**, but can be enabled for messaging platforms by setting `display.tool_progress_command: true` in `config.yaml`. When enabled, it cycles the `display.tool_progress` mode and saves to config.
 - `/status`, `/sethome`, `/update`, `/approve`, `/deny`, and `/commands` are **messaging-only** commands.
 - `/background`, `/voice`, `/reload-mcp`, `/rollback`, and `/yolo` work in **both** the CLI and the messaging gateway.

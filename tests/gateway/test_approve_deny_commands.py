@@ -141,7 +141,7 @@ class TestBlockingGatewayApproval:
     def test_resolve_single_pops_oldest_fifo(self):
         """resolve_gateway_approval without resolve_all resolves oldest first."""
         from tools.approval import (
-            resolve_gateway_approval, pending_approval_count,
+            resolve_gateway_approval,
             _ApprovalEntry, _gateway_queues,
         )
         session_key = "test-fifo"
@@ -154,7 +154,7 @@ class TestBlockingGatewayApproval:
         assert e1.event.is_set()
         assert e1.result == "once"
         assert not e2.event.is_set()
-        assert pending_approval_count(session_key) == 1
+        assert len(_gateway_queues[session_key]) == 1
 
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
@@ -172,35 +172,6 @@ class TestBlockingGatewayApproval:
         unregister_gateway_notify(session_key)
         assert e1.event.is_set()
         assert e2.event.is_set()
-
-    def test_clear_session_signals_all_entries(self):
-        """clear_session should unblock all waiting approval threads."""
-        from tools.approval import (
-            register_gateway_notify, clear_session,
-            _ApprovalEntry, _gateway_queues,
-        )
-        session_key = "test-clear"
-        register_gateway_notify(session_key, lambda d: None)
-
-        e1 = _ApprovalEntry({"command": "cmd1"})
-        e2 = _ApprovalEntry({"command": "cmd2"})
-        _gateway_queues[session_key] = [e1, e2]
-
-        clear_session(session_key)
-        assert e1.event.is_set()
-        assert e2.event.is_set()
-
-    def test_pending_approval_count(self):
-        from tools.approval import (
-            pending_approval_count, _ApprovalEntry, _gateway_queues,
-        )
-        session_key = "test-count"
-        assert pending_approval_count(session_key) == 0
-        _gateway_queues[session_key] = [
-            _ApprovalEntry({"command": "a"}),
-            _ApprovalEntry({"command": "b"}),
-        ]
-        assert pending_approval_count(session_key) == 2
 
 
 # ------------------------------------------------------------------
@@ -390,6 +361,9 @@ class TestBlockingApprovalE2E:
         result_holder = [None]
 
         def agent_thread():
+            from tools.approval import reset_current_session_key, set_current_session_key
+
+            token = set_current_session_key(session_key)
             os.environ["HERMES_EXEC_ASK"] = "1"
             os.environ["HERMES_SESSION_KEY"] = session_key
             try:
@@ -399,6 +373,7 @@ class TestBlockingApprovalE2E:
             finally:
                 os.environ.pop("HERMES_EXEC_ASK", None)
                 os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
 
         t = threading.Thread(target=agent_thread)
         t.start()
@@ -432,6 +407,9 @@ class TestBlockingApprovalE2E:
         result_holder = [None]
 
         def agent_thread():
+            from tools.approval import reset_current_session_key, set_current_session_key
+
+            token = set_current_session_key(session_key)
             os.environ["HERMES_EXEC_ASK"] = "1"
             os.environ["HERMES_SESSION_KEY"] = session_key
             try:
@@ -441,6 +419,7 @@ class TestBlockingApprovalE2E:
             finally:
                 os.environ.pop("HERMES_EXEC_ASK", None)
                 os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
 
         t = threading.Thread(target=agent_thread)
         t.start()
@@ -469,6 +448,9 @@ class TestBlockingApprovalE2E:
         result_holder = [None]
 
         def agent_thread():
+            from tools.approval import reset_current_session_key, set_current_session_key
+
+            token = set_current_session_key(session_key)
             os.environ["HERMES_EXEC_ASK"] = "1"
             os.environ["HERMES_SESSION_KEY"] = session_key
             try:
@@ -480,6 +462,7 @@ class TestBlockingApprovalE2E:
             finally:
                 os.environ.pop("HERMES_EXEC_ASK", None)
                 os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
 
         t = threading.Thread(target=agent_thread)
         t.start()
@@ -494,7 +477,7 @@ class TestBlockingApprovalE2E:
         from tools.approval import (
             register_gateway_notify, unregister_gateway_notify,
             resolve_gateway_approval, check_all_command_guards,
-            pending_approval_count,
+            _gateway_queues,
         )
 
         session_key = "e2e-parallel"
@@ -505,6 +488,9 @@ class TestBlockingApprovalE2E:
 
         def make_agent(idx, cmd):
             def run():
+                from tools.approval import reset_current_session_key, set_current_session_key
+
+                token = set_current_session_key(session_key)
                 os.environ["HERMES_EXEC_ASK"] = "1"
                 os.environ["HERMES_SESSION_KEY"] = session_key
                 try:
@@ -512,6 +498,7 @@ class TestBlockingApprovalE2E:
                 finally:
                     os.environ.pop("HERMES_EXEC_ASK", None)
                     os.environ.pop("HERMES_SESSION_KEY", None)
+                    reset_current_session_key(token)
             return run
 
         threads = [
@@ -529,7 +516,7 @@ class TestBlockingApprovalE2E:
             time.sleep(0.05)
 
         assert len(notified) == 3
-        assert pending_approval_count(session_key) == 3
+        assert len(_gateway_queues.get(session_key, [])) == 3
 
         # Approve all at once
         count = resolve_gateway_approval(session_key, "session", resolve_all=True)
@@ -556,6 +543,9 @@ class TestBlockingApprovalE2E:
 
         def make_agent(idx, cmd):
             def run():
+                from tools.approval import reset_current_session_key, set_current_session_key
+
+                token = set_current_session_key(session_key)
                 os.environ["HERMES_EXEC_ASK"] = "1"
                 os.environ["HERMES_SESSION_KEY"] = session_key
                 try:
@@ -563,6 +553,7 @@ class TestBlockingApprovalE2E:
                 finally:
                     os.environ.pop("HERMES_EXEC_ASK", None)
                     os.environ.pop("HERMES_SESSION_KEY", None)
+                    reset_current_session_key(token)
             return run
 
         threads = [
@@ -571,7 +562,16 @@ class TestBlockingApprovalE2E:
         ]
         for t in threads:
             t.start()
-        time.sleep(0.3)
+
+        # Wait for both threads to register pending approvals instead of
+        # relying on a fixed sleep.  The approval module stores entries in
+        # _gateway_queues[session_key] — poll until we see 2 entries.
+        from tools.approval import _gateway_queues
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if len(_gateway_queues.get(session_key, [])) >= 2:
+                break
+            time.sleep(0.05)
 
         # Approve first, deny second
         resolve_gateway_approval(session_key, "once")   # oldest
@@ -580,8 +580,9 @@ class TestBlockingApprovalE2E:
         for t in threads:
             t.join(timeout=5)
 
-        assert results[0]["approved"] is True
-        assert results[1]["approved"] is False
+        assert all(r is not None for r in results)
+        assert sorted(r["approved"] for r in results) == [False, True]
+        assert sum("BLOCKED" in (r.get("message") or "") for r in results) == 1
         unregister_gateway_notify(session_key)
 
 

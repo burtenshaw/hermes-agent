@@ -187,9 +187,23 @@ When scheduling jobs, you specify where the output goes:
 | `"origin"` | Back to where the job was created | Default on messaging platforms |
 | `"local"` | Save to local files only (`~/.hermes/cron/output/`) | Default on CLI |
 | `"telegram"` | Telegram home channel | Uses `TELEGRAM_HOME_CHANNEL` |
-| `"discord"` | Discord home channel | Uses `DISCORD_HOME_CHANNEL` |
 | `"telegram:123456"` | Specific Telegram chat by ID | Direct delivery |
-| `"discord:987654"` | Specific Discord channel by ID | Direct delivery |
+| `"telegram:-100123:17585"` | Specific Telegram topic | `chat_id:thread_id` format |
+| `"discord"` | Discord home channel | Uses `DISCORD_HOME_CHANNEL` |
+| `"discord:#engineering"` | Specific Discord channel | By channel name |
+| `"slack"` | Slack home channel | |
+| `"whatsapp"` | WhatsApp home | |
+| `"signal"` | Signal | |
+| `"matrix"` | Matrix home room | |
+| `"mattermost"` | Mattermost home channel | |
+| `"email"` | Email | |
+| `"sms"` | SMS via Twilio | |
+| `"homeassistant"` | Home Assistant | |
+| `"dingtalk"` | DingTalk | |
+| `"feishu"` | Feishu/Lark | |
+| `"wecom"` | WeCom | |
+| `"weixin"` | Weixin (WeChat) | |
+| `"bluebubbles"` | BlueBubbles (iMessage) | |
 
 The agent's final response is automatically delivered. You do not need to call `send_message` in the cron prompt.
 
@@ -226,6 +240,27 @@ Otherwise, report the issue.
 ```
 
 Failed jobs always deliver regardless of the `[SILENT]` marker — only successful runs can be silenced.
+
+## Script timeout
+
+Pre-run scripts (attached via the `script` parameter) have a default timeout of 120 seconds. If your scripts need longer — for example, to include randomized delays that avoid bot-like timing patterns — you can increase this:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  script_timeout_seconds: 300   # 5 minutes
+```
+
+Or set the `HERMES_CRON_SCRIPT_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 120s default.
+
+## Provider recovery
+
+Cron jobs inherit your configured fallback providers and credential pool rotation. If the primary API key is rate-limited or the provider returns an error, the cron agent can:
+
+- **Fall back to an alternate provider** if you have `fallback_providers` (or the legacy `fallback_model`) configured in `config.yaml`
+- **Rotate to the next credential** in your [credential pool](/docs/user-guide/configuration#credential-pool-strategies) for the same provider
+
+This means cron jobs that run at high frequency or during peak hours are more resilient — a single rate-limited key won't fail the entire run.
 
 ## Schedule formats
 
